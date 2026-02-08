@@ -133,12 +133,33 @@
         // --- CONSTANTS ---
         const DEFAULT_KEYS = { omdb: '5591108c', tmdb: '68b27c1f85725736f0aec18b903197b0', rapid: '9782bOaf7fmsh8b54c22e5cOaf5cp13e6e8jsn8e2e765657a5' };
         
+        // 🔥 A. SMART_LISTS (huge upgrade)
         const SMART_LISTS = [
             { id: 'top_rated', label: 'Top Rated', icon: Star, filter: item => item.userMeta?.ratings?.overall >= 9 },
             { id: 'rewatch', label: 'Rewatch Worthy', icon: Repeat, filter: item => item.userMeta?.rewatchCount > 0 },
-            { id: 'masterpiece', label: 'Masterpieces', icon: Zap, filter: item => item.userMeta?.ratings?.overall >= 9.5 || (item.userMeta?.ratings?.story >= 9 && item.userMeta?.ratings?.emotion >= 9) },
-            { id: 'progress', label: 'In Progress', icon: Play, filter: item => item.userMeta?.series?.lastEpisode?.season > 0 && !item.userMeta?.series?.completed },
+            { id: 'foreign', label: 'Foreign', icon: Globe, filter: item => item.Language && !item.Language.includes('English') },
+            { id: 'progress', label: 'In Progress', icon: Play, filter: item => item.userMeta?.series?.lastEpisode?.season > 0 },
         ];
+
+        // --- HELPERS (Outside App) ---
+        const normalize = (q) => q.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+        const SEARCH_TTL = 7 * 24 * 60 * 60 * 1000;
+
+        const getSearchCache = (key) => {
+          try {
+            const raw = localStorage.getItem(key);
+            if (!raw) return null;
+            const { data, ts } = JSON.parse(raw);
+            if (Date.now() - ts > SEARCH_TTL) return null;
+            return data;
+          } catch (e) { return null; }
+        };
+
+        const setSearchCache = (key, data) => {
+          try {
+            localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() }));
+          } catch (e) { console.warn("Cache quota exceeded"); }
+        };
 
         // --- UTILS ---
         const getHighResPoster = (url, width = 600) => {
@@ -150,22 +171,32 @@
             return url;
         };
 
+        // D. migrateItem() (this is critical)
         const migrateItem = (item, status) => {
-            if (item.userMeta) return item; 
-            const isSeries = item.Type === 'series' || item.Genre?.includes('Animation');
+            if (item.userMeta) return item;
+            
+            // Preserve old rating if available
+            const oldRating = parseFloat(item.userRating || 0);
+            const isSeries = item.Type === 'series';
+
             return {
-                ...item,
-                userMeta: {
-                    status: status,
-                    userRating: 0,
-                    lastUpdated: Date.now(),
-                    watchedOn: new Date().toISOString().split('T')[0],
-                    rewatchCount: 0,
-                    autoOverall: true,
-                    notes: "",
-                    series: isSeries ? { lastEpisode: { season: 0, episode: 0 }, completed: false } : null,
-                    ratings: { overall: 0, story: 0, direction: 0, emotion: 0 }
-                }
+              ...item,
+              userMeta: {
+                status,
+                userRating: oldRating, // Keeping this to prevent data loss despite snippet
+                rewatchCount: 0,
+                // Critical logic from snippet D
+                series: isSeries ? {
+                  lastEpisode: { season: 0, episode: 0 },
+                  completed: false
+                } : null,
+                // Critical V7 props
+                ratings: { overall: oldRating, story: 0, direction: 0, emotion: 0 },
+                lastUpdated: Date.now(),
+                watchedOn: new Date().toISOString().split('T')[0],
+                autoOverall: true,
+                notes: ""
+              }
             };
         };
 
@@ -301,6 +332,7 @@
             
             // -- UI State --
             const [searchQuery, setSearchQuery] = useState('');
+            const [searchResults, setSearchResults] = useState([]);
             const [activeFilter, setActiveFilter] = useState('all');
             const [activeSmartList, setActiveSmartList] = useState(null);
             const [sortBy, setSortBy] = useState('updated');
@@ -347,6 +379,80 @@
               setSession(null);
             };
 
+            // -- BACKUP & RESTORE --
+            const handleExport = () => {
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(vault));
+                const downloadAnchorNode = document.createElement('a');
+                downloadAnchorNode.setAttribute("href", dataStr);
+                downloadAnchorNode.setAttribute("download", "vault_backup_" + new Date().toISOString().split('T')[0] + ".json");
+                document.body.appendChild(downloadAnchorNode);
+                downloadAnchorNode.click();
+                downloadAnchorNode.remove();
+            };
+
+            const handleImport = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        const rawData = JSON.parse(event.target.result);
+                        if (!rawData.watched && !rawData.watchlist) throw new Error("Invalid format: Not a Vault backup file");
+                        
+                        // MIGRATION LOGIC
+                        const processedVault = { watched: {}, watchlist: {} };
+                        
+                        Object.entries(rawData.watched || {}).forEach(([id, item]) => {
+                            processedVault.watched[id] = migrateItem(item, 'watched');
+                        });
+                        
+                        Object.entries(rawData.watchlist || {}).forEach(([id, item]) => {
+                            processedVault.watchlist[id] = migrateItem(item, 'watchlist');
+                        });
+
+                        // 1. Update Local State & Storage (Immediate UI Update)
+                        setVault(processedVault);
+                        localStorage.setItem('vault_v6_data', JSON.stringify(processedVault));
+                        
+                        // 2. Cloud Sync (if logged in) - REPLACES existing data
+                        if (session) {
+                            setSyncStatus('syncing');
+                            
+                            // Delete all existing items for this user (Replace logic)
+                            await supabase.from('vault_items').delete().eq('user_id', session.user.id);
+
+                            // Transform to flat array for upload
+                            const items = [];
+                            [...Object.values(processedVault.watched), ...Object.values(processedVault.watchlist)].forEach(item => {
+                                items.push({
+                                    user_id: session.user.id,
+                                    imdb_id: item.imdbID,
+                                    user_meta: item,
+                                    updated_at: new Date()
+                                });
+                            });
+
+                            // Upload in chunks to avoid payload limits
+                            const chunkSize = 50;
+                            for (let i = 0; i < items.length; i += chunkSize) {
+                                const chunk = items.slice(i, i + chunkSize);
+                                const { error } = await supabase.from('vault_items').upsert(chunk);
+                                if (error) console.error("Chunk upload error:", error);
+                            }
+                            
+                            setSyncStatus('idle');
+                        }
+                        
+                        setShowSettings(false);
+                        alert("Vault restored successfully!");
+                    } catch (err) {
+                        console.error(err);
+                        alert("Failed to import file: " + err.message);
+                    }
+                };
+                reader.readAsText(file);
+            };
+
 
             // Cloud Fetch Effect (The user requested snippet logic)
            useEffect(() => {
@@ -367,8 +473,13 @@
                   const newVault = { watched: {}, watchlist: {} };
 
                   data.forEach(row => {
-                    const item = row.user_meta;
-                    if (item.userMeta.status === "watched")
+                    let item = row.user_meta;
+                    // Migrate item if coming from raw cloud data that might be old
+                    // Heuristic: if userRating > 0 or previously marked as watched, default to watched
+                    const defaultStatus = (item.userRating && parseFloat(item.userRating) > 0) ? 'watched' : 'watchlist';
+                    item = migrateItem(item, defaultStatus); 
+                    
+                    if (item.userMeta?.status === "watched")
                       newVault.watched[row.imdb_id] = item;
                     else
                       newVault.watchlist[row.imdb_id] = item;
@@ -425,6 +536,115 @@
                 });
             }, [session]);
 
+            // --- SEARCH LOGIC ---
+
+            // Check if item exists in vault
+            const existsInVault = useCallback((imdbID) => {
+                return !!(vault.watched[imdbID] || vault.watchlist[imdbID]);
+            }, [vault]);
+
+            // Offline search
+            const searchOfflineVault = useCallback((query) => {
+              const norm = normalize(query);
+              if (!norm) return [];
+              const all = [
+                ...Object.values(vault.watched),
+                ...Object.values(vault.watchlist)
+              ];
+              return all.filter(item =>
+                normalize(item.Title).includes(norm) ||
+                item.imdbID === query
+              );
+            }, [vault]);
+
+            const smartSearch = useCallback(async (query, type = "", year = "") => {
+              // 1. Offline
+              const offline = searchOfflineVault(query);
+              if (offline.length > 0) return { source: "offline", results: offline };
+
+              const cacheKey = `vault_search_${type}_${query}_${year}`;
+              
+              // 2. Cache
+              const cached = getSearchCache(cacheKey);
+              if (cached) return { source: "cache", results: cached };
+
+              // 3. Remote
+              try {
+                  const res = await fetch(
+                    `https://www.omdbapi.com/?apikey=${apiKeys.omdb}&s=${encodeURIComponent(query)}&type=${type}&y=${year}`
+                  );
+                  const json = await res.json();
+                  if (json.Response === "False") return { source: "none", results: [] };
+
+                  // 4. Rank
+                  const ranked = json.Search.sort((a, b) => {
+                    const exactA = normalize(a.Title) === normalize(query);
+                    const exactB = normalize(b.Title) === normalize(query);
+                    if (exactA !== exactB) return exactB - exactA;
+                    return (parseInt(b.Year) || 0) - (parseInt(a.Year) || 0);
+                  });
+
+                  setSearchCache(cacheKey, ranked);
+                  return { source: "remote", results: ranked };
+              } catch (e) {
+                  console.error(e);
+                  return { source: "error", results: [] };
+              }
+            }, [apiKeys, searchOfflineVault]);
+
+            const fetchMovieById = async (imdbID) => {
+               try {
+                   const res = await fetch(
+                    `https://www.omdbapi.com/?apikey=${apiKeys.omdb}&i=${imdbID}&plot=full`
+                   );
+                   return await res.json();
+               } catch(e) {
+                   console.error("Fetch ID error:", e);
+                   return null;
+               }
+            };
+
+            const addToVault = async (imdbID, status = "watchlist") => {
+              const fullItem = await fetchMovieById(imdbID);
+
+              if (!fullItem || fullItem.Response === "False") return;
+
+              const migrated = migrateItem(fullItem, status);
+
+              setVault(prev => {
+                const next = {
+                  watched: { ...prev.watched },
+                  watchlist: { ...prev.watchlist }
+                };
+
+                // Remove from other list if it exists (implicit move)
+                delete next.watched[imdbID];
+                delete next.watchlist[imdbID];
+
+                if (status === "watched") {
+                  next.watched[imdbID] = migrated;
+                } else {
+                  next.watchlist[imdbID] = migrated;
+                }
+
+                return next;
+              });
+
+              // 🔁 Cloud sync
+              saveToCloud(imdbID, migrated);
+              setSearchResults([]);
+              setSearchQuery('');
+            };
+
+            const handleSearch = async (q) => {
+              if (!q || q.length < 3) {
+                  setSearchResults([]);
+                  return;
+              }
+              const { results } = await smartSearch(q);
+              setSearchResults(results || []);
+            };
+
             // ... (Rest of the bulk actions logic remains the same, just add cloud deletes if needed)
             const handleBulkAction = (action) => {
                // Simplified for brevity - assumes local update first
@@ -437,13 +657,14 @@
             const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
 
             // -- Computed Data (Same as v6) --
+            // B. Unified allItems search space
             const allItems = useMemo(() => [...Object.values(vault.watched), ...Object.values(vault.watchlist)], [vault]);
             const analytics = useMemo(() => {
                 const total = allItems.length;
                 if (total === 0) return { avgRating: 0, totalRewatch: 0, watchedCount: 0 };
                 const watched = Object.values(vault.watched);
-                const avgRating = watched.reduce((acc, curr) => acc + curr.userMeta.ratings.overall, 0) / (watched.length || 1);
-                const totalRewatch = watched.reduce((acc, curr) => acc + curr.userMeta.rewatchCount, 0);
+                const avgRating = watched.reduce((acc, curr) => acc + (curr.userMeta?.ratings?.overall || 0), 0) / (watched.length || 1);
+                const totalRewatch = watched.reduce((acc, curr) => acc + (curr.userMeta?.rewatchCount || 0), 0);
                 return { avgRating: avgRating.toFixed(1), totalRewatch, watchedCount: watched.length };
             }, [allItems, vault]);
 
@@ -451,7 +672,8 @@
                 let items = allItems;
                 if (searchQuery) {
                     const q = searchQuery.toLowerCase();
-                    items = items.filter(i => i.Title.toLowerCase().includes(q) || i.Genre?.toLowerCase().includes(q));
+                    // C. Library search pipeline (simple but effective) - Only title
+                    items = items.filter(i => i.Title.toLowerCase().includes(q));
                 }
                 if (activeSmartList) {
                     const list = SMART_LISTS.find(l => l.id === activeSmartList);
@@ -461,8 +683,8 @@
                      else if (activeFilter === 'series') items = items.filter(i => i.Type === 'series');
                 }
                 return items.sort((a, b) => {
-                    if (sortBy === 'rating') return (b.userMeta.ratings.overall || 0) - (a.userMeta.ratings.overall || 0);
-                    if (sortBy === 'updated') return (b.userMeta.lastUpdated || 0) - (a.userMeta.lastUpdated || 0);
+                    if (sortBy === 'rating') return (b.userMeta?.ratings?.overall || 0) - (a.userMeta?.ratings?.overall || 0);
+                    if (sortBy === 'updated') return (b.userMeta?.lastUpdated || 0) - (a.userMeta?.lastUpdated || 0);
                     return a.Title.localeCompare(b.Title); 
                 });
             }, [allItems, searchQuery, activeFilter, activeSmartList, sortBy]);
@@ -484,7 +706,65 @@
                          </div>
                          <div className="flex-1 max-w-md mx-4 hidden md:block relative">
                             <Search className="absolute left-3 top-2.5 text-gray-400" size={16} />
-                            <input type="text" placeholder="Search..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-gray-100 dark:bg-gray-800 rounded-full pl-10 pr-4 py-2 text-sm text-gray-900 dark:text-white outline-none focus:border-indigo-500" />
+                            <input 
+                                type="text" 
+                                placeholder="Search movies or series..." 
+                                value={searchQuery} 
+                                onChange={async (e) => {
+                                    setSearchQuery(e.target.value);
+                                    if (e.target.value.length > 2) {
+                                      await handleSearch(e.target.value);
+                                    } else {
+                                      setSearchResults([]);
+                                    }
+                                }}
+                                className="w-full bg-gray-100 dark:bg-gray-800 rounded-full pl-10 pr-4 py-2 text-sm text-gray-900 dark:text-white outline-none focus:border-indigo-500" 
+                            />
+                            
+                            {searchResults.length > 0 && (
+                              <div className="absolute z-50 mt-2 w-full bg-white dark:bg-dark-card rounded-xl shadow-xl max-h-96 overflow-y-auto border border-gray-200 dark:border-gray-700">
+                                {searchResults.map(item => {
+                                  const inVault = existsInVault(item.imdbID);
+                                  return (
+                                    <div
+                                        key={item.imdbID}
+                                        className="flex items-center justify-between px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                                    >
+                                        <div className="flex-1 min-w-0 mr-2">
+                                        <p className="font-semibold text-sm truncate dark:text-white">{item.Title}</p>
+                                        <p className="text-xs text-gray-500">
+                                            {item.Year} • {item.Type}
+                                        </p>
+                                        </div>
+
+                                        <div className="flex gap-2 shrink-0">
+                                        {inVault ? (
+                                            <span className="text-xs px-3 py-1.5 rounded-lg bg-gray-200 dark:bg-gray-700 text-gray-500 font-medium cursor-default">
+                                                In Vault
+                                            </span>
+                                        ) : (
+                                            <>
+                                            <button
+                                                onClick={() => addToVault(item.imdbID, "watchlist")}
+                                                className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-medium"
+                                            >
+                                                Watchlist
+                                            </button>
+
+                                            <button
+                                                onClick={() => addToVault(item.imdbID, "watched")}
+                                                className="text-xs px-3 py-1.5 rounded-lg bg-green-600 hover:bg-green-700 text-white font-medium"
+                                            >
+                                                Watched
+                                            </button>
+                                            </>
+                                        )}
+                                        </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
                          </div>
                          <div className="flex items-center gap-2">
                              {!session ? (
@@ -520,6 +800,9 @@
                                 {[ { id: 'all', label: 'Everything' }, { id: 'movies', label: 'Movies' }, { id: 'series', label: 'TV Shows' } ].map(f => (
                                     <button key={f.id} onClick={() => { setActiveFilter(f.id); setActiveSmartList(null); }} className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors whitespace-nowrap ${activeFilter === f.id && !activeSmartList ? 'bg-gray-900 text-white dark:bg-white dark:text-black' : 'text-gray-500 hover:bg-gray-200 dark:text-gray-400 dark:hover:bg-gray-800'}`}>{f.label}</button>
                                 ))}
+                                {SMART_LISTS.map(list => (
+                                     <button key={list.id} onClick={() => { setActiveSmartList(list.id === activeSmartList ? null : list.id); setActiveFilter('all'); }} className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors whitespace-nowrap flex items-center gap-2 ${activeSmartList === list.id ? 'bg-indigo-600 text-white' : 'text-gray-500 hover:bg-gray-200 dark:text-gray-400 dark:hover:bg-gray-800'}`}><list.icon size={14}/> {list.label}</button>
+                                ))}
                             </div>
                         </div>
 
@@ -530,9 +813,9 @@
                                     <div className="relative aspect-[2/3] overflow-hidden bg-gray-900">
                                         <img src={getHighResPoster(item.Poster, 400)} className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity" loading="lazy" />
                                         <div className="absolute top-2 right-2 flex flex-col gap-1 items-end">
-                                             {item.userMeta.status === 'watched' && <span className="bg-green-500/90 text-white text-[10px] font-bold px-2 py-1 rounded-md shadow-lg"><CheckCircle size={10} /></span>}
+                                             {item.userMeta?.status === 'watched' && <span className="bg-green-500/90 text-white text-[10px] font-bold px-2 py-1 rounded-md shadow-lg"><CheckCircle size={10} /></span>}
                                         </div>
-                                        {item.userMeta.ratings.overall > 0 && <div className="absolute bottom-2 left-2 bg-yellow-500 text-white px-1.5 py-0.5 rounded text-xs font-bold flex items-center gap-1 shadow-lg"><Star size={10} fill="currentColor" /> {item.userMeta.ratings.overall}</div>}
+                                        {item.userMeta?.ratings?.overall > 0 && <div className="absolute bottom-2 left-2 bg-yellow-500 text-white px-1.5 py-0.5 rounded text-xs font-bold flex items-center gap-1 shadow-lg"><Star size={10} fill="currentColor" /> {item.userMeta.ratings.overall}</div>}
                                     </div>
                                     <div className="p-3">
                                         <h3 className="text-gray-900 dark:text-white font-bold text-sm line-clamp-1">{item.Title}</h3>
@@ -555,8 +838,8 @@
                                  <div className="mb-4">
                                      <label className="block text-xs font-bold uppercase text-gray-500 mb-1">Status</label>
                                      <div className="flex gap-2">
-                                        <button onClick={() => updateItem(selectedMovie.imdbID, i => ({...i, userMeta: {...i.userMeta, status: 'watched'}}))} className={`flex-1 py-2 rounded border text-sm font-bold ${selectedMovie.userMeta.status === 'watched' ? 'bg-green-500 text-white' : 'dark:text-white'}`}>Watched</button>
-                                        <button onClick={() => updateItem(selectedMovie.imdbID, i => ({...i, userMeta: {...i.userMeta, status: 'watchlist'}}))} className={`flex-1 py-2 rounded border text-sm font-bold ${selectedMovie.userMeta.status === 'watchlist' ? 'bg-blue-500 text-white' : 'dark:text-white'}`}>Watchlist</button>
+                                        <button onClick={() => updateItem(selectedMovie.imdbID, i => ({...i, userMeta: {...i.userMeta, status: 'watched'}}))} className={`flex-1 py-2 rounded border text-sm font-bold ${selectedMovie.userMeta?.status === 'watched' ? 'bg-green-500 text-white' : 'dark:text-white'}`}>Watched</button>
+                                        <button onClick={() => updateItem(selectedMovie.imdbID, i => ({...i, userMeta: {...i.userMeta, status: 'watchlist'}}))} className={`flex-1 py-2 rounded border text-sm font-bold ${selectedMovie.userMeta?.status === 'watchlist' ? 'bg-blue-500 text-white' : 'dark:text-white'}`}>Watchlist</button>
                                      </div>
                                  </div>
                              </div>
@@ -564,15 +847,14 @@
                      )}
 
                     <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} apiKeys={apiKeys} setApiKeys={setApiKeys} theme={theme} setTheme={setTheme} 
+                        onImport={handleImport}
+                        onExport={handleExport}
                         onReset={async () => {
-                          if (!session) return;
-
-                          await supabase
-                            .from("vault_items")
-                            .delete()
-                            .eq("user_id", session.user.id);
-
+                          if (session) {
+                             await supabase.from("vault_items").delete().eq("user_id", session.user.id);
+                          }
                           setVault({ watched: {}, watchlist: {} });
+                          localStorage.removeItem("vault_v6_data");
                         }}
                     />
                 </div>

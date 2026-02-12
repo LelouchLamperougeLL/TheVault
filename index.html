@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Vault v9.2 - Profile Edition</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="style.css">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        vault: {
+                            950: '#050609',
+                            900: '#0a0c12',
+                            800: '#11141d',
+                            700: '#1c2230',
+                            accent: '#6366f1',
+                            secondary: '#10b981',
+                            gold: '#f59e0b'
+                        }
+                    },
+                    animation: {
+                        'float': 'float 6s ease-in-out infinite',
+                        'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'reveal': 'reveal 0.5s cubic-bezier(0.16, 1, 0.3, 1)',
+                    },
+                    keyframes: {
+                        float: {
+                            '0%, 100%': { transform: 'translateY(0)' },
+                            '50%': { transform: 'translateY(-10px)' },
+                        },
+                        reveal: {
+                            '0%': { opacity: '0', transform: 'translateY(20px) scale(0.95)' },
+                            '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="selection:bg-indigo-500/30">
+    <div id="root"></div>
+
+    <script src="logic.js"></script>
+
+    <script type="text/babel" src="app.js"></script>
+</body>
+</html>

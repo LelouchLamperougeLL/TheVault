@@ -115,7 +115,6 @@
             -webkit-text-fill-color: transparent;
         }
         
-        /* Profile Hero Enhancement */
         .profile-hero {
             position: relative;
             overflow: hidden;
@@ -138,10 +137,7 @@
             pointer-events: none;
         }
 
-        /* Card Glow Effect */
-        .group:hover .media-glow {
-            opacity: 1;
-        }
+        .group:hover .media-glow { opacity: 1; }
         .media-glow {
             position: absolute;
             inset: -1px;
@@ -171,16 +167,11 @@
     <script type="text/babel">
         const { useState, useMemo, useEffect, useCallback, useRef } = React;
         
-        // ==========================================
-        // SECTION 1: GLOBAL CONFIGURATION & CONSTANTS
-        // ==========================================
-        
         const SUPABASE_URL = "https://ugllcdapuzihpkgcoaxj.supabase.co";
         const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVnbGxjZGFwdXppaHBrZ2NvYXhqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTA3NzksImV4cCI6MjA4NjA2Njc3OX0.73I1cW1fqRUha5_6spK7C8m-SXUHQQfyjmcbNNbdfCI";
         
-        // 3. Supabase Client Global Access Risk - Safe Version
         const mockSupabase = {
-            from: () => ({ select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null }) }) }), upsert: () => Promise.resolve(), delete: () => ({ eq: () => ({ eq: () => Promise.resolve() }) }) }),
+            from: () => ({ select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null }) }) }), upsert: () => Promise.resolve(), delete: () => ({ eq: () => ({ eq: () => Promise.resolve() }) }), insert: () => Promise.resolve({ error: null }) }),
             auth: { getUser: () => Promise.resolve({ data: { user: null } }), getSession: () => Promise.resolve({ data: { session: null } }), onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => {} } } }), signInWithPassword: () => Promise.resolve({ error: { message: "Supabase client not loaded." } }), signOut: () => Promise.resolve() }
         };
         const supabase = (window.supabase && window.supabase.createClient) 
@@ -190,68 +181,24 @@
         const ADMIN_IDS = ["74e5b3ea-113f-4d6c-be2a-b0b52b2e92c3"];
         const DEFAULT_KEYS = { omdb: '5591108c', tmdb: '68b27c1f85725736f0aec18b903197b0', rapid: '9782bOaf7fmsh8b54c22e5cOaf5cp13e6e8jsn8e2e765657a5' };
         const RAPID_HOST_MDL = 'mydramalist-api.p.rapidapi.com';
-        const MDL_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+        
+        const VIEWS = { LIBRARY: 'library', MOVIES: 'movies', SERIES: 'series', PROFILE: 'profile' };
+        const ASIAN_SOURCES = { MDL: 'mdl', MAL: 'mal' };
+        const CACHE_CONFIG = { VERSION: 'v1', TTL_MS: 30 * 24 * 60 * 60 * 1000, PREFIX: 'cinestat_cache:', MAX_ENTRIES: 500 };
 
-        const VIEWS = {
-            LIBRARY: 'library',
-            MOVIES: 'movies',
-            SERIES: 'series',
-            PROFILE: 'profile'
-        };
-
-        const ASIAN_SOURCES = {
-            MDL: 'mdl',
-            MAL: 'mal'
-        };
-
-        // Cache Configuration
-        const CACHE_CONFIG = {
-            VERSION: 'v1',
-            TTL_MS: 30 * 24 * 60 * 60 * 1000, // 30 days
-            PREFIX: 'cinestat_cache:',
-            MAX_ENTRIES: 500
-        };
-
-        const EAST_SE_ASIA_COUNTRIES = [
-            'japan', 'south korea', 'north korea', 'korea',
-            'china', 'hong kong', 'taiwan',
-            'thailand', 'vietnam', 'philippines',
-            'malaysia', 'indonesia', 'singapore'
-        ];
-        const EAST_SE_ASIA_LANGUAGES = [
-            'japanese', 'korean',
-            'mandarin', 'cantonese', 'chinese',
-            'thai', 'vietnamese',
-            'malay', 'indonesian'
-        ];
-        const WESTERN_COUNTRIES = [
-            'united states', 'usa', 'canada',
-            'united kingdom', 'uk', 'england',
-            'france', 'germany', 'spain',
-            'australia'
-        ];
-        const WESTERN_LANGUAGES = [
-            'english', 'french', 'spanish',
-            'german', 'italian', 'portuguese'
-        ];
-
-        // ==========================================
-        // SECTION 2: CORE UTILITIES (Framework Agnostic)
-        // ==========================================
+        const EAST_SE_ASIA_COUNTRIES = ['japan', 'south korea', 'north korea', 'korea', 'china', 'hong kong', 'taiwan', 'thailand', 'vietnam', 'philippines', 'malaysia', 'indonesia', 'singapore'];
+        const EAST_SE_ASIA_LANGUAGES = ['japanese', 'korean', 'mandarin', 'cantonese', 'chinese', 'thai', 'vietnamese', 'malay', 'indonesian'];
+        const WESTERN_COUNTRIES = ['united states', 'usa', 'canada', 'united kingdom', 'uk', 'england', 'france', 'germany', 'spain', 'australia'];
+        const WESTERN_LANGUAGES = ['english', 'french', 'spanish', 'german', 'italian', 'portuguese'];
 
         const normalize = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
         const now = () => Date.now();
-        const isAdminUser = (user) => {
-            if (!user || !user.id) return false;
-            return ADMIN_IDS.includes(user.id);
-        };
+        const isAdminUser = (user) => user && user.id && ADMIN_IDS.includes(user.id);
 
         async function safeFetch(url, options = {}, retries = 2) {
             try {
                 const res = await fetch(url, options);
-                if (!res.ok) {
-                    return { error: true, status: res.status };
-                }
+                if (!res.ok) return { error: true, status: res.status };
                 return await res.json();
             } catch (e) {
                 if (retries > 0) {
@@ -264,12 +211,10 @@
 
         function humanizeReason(reason) {
             if (reason === 'exact-title') return 'Exact title match';
-            if (reason.startsWith('fuzzy'))
-                return `Title similarity ${reason.match(/\d+/)?.[0]}%`;
+            if (reason.startsWith('fuzzy')) return `Title similarity ${reason.match(/\d+/)?.[0]}%`;
             if (reason === 'exact-year') return 'Exact release year';
             if (reason === 'near-year') return 'Close release year';
-            if (reason.startsWith('popularity'))
-                return 'Popular title';
+            if (reason.startsWith('popularity')) return 'Popular title';
             if (reason.includes('tmdb')) return 'Trusted source (TMDB)';
             if (reason.includes('tvmaze')) return 'Trusted source (TVMaze)';
             return reason;
@@ -286,74 +231,42 @@
         const formatCurrency = (val) => val ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(val) : 'N/A';
         const hashString = (str) => {
             let hash = 0;
-            for (let i = 0; i < str.length; i++) {
-                hash = (hash << 5) - hash + str.charCodeAt(i);
-                hash |= 0; 
-            }
+            for (let i = 0; i < str.length; i++) { hash = (hash << 5) - hash + str.charCodeAt(i); hash |= 0; }
             return Math.abs(hash).toString(16);
         };
-
-        // ==========================================
-        // SECTION 3: CACHING & STORAGE SYSTEM
-        // ==========================================
 
         function createStorage() {
             try {
                 const k = '__test__';
                 localStorage.setItem(k, '1');
                 localStorage.removeItem(k);
-                return {
-                    get: k => localStorage.getItem(k),
-                    set: (k, v) => localStorage.setItem(k, v),
-                    remove: k => localStorage.removeItem(k),
-                    keys: () => Object.keys(localStorage)
-                };
+                return { get: k => localStorage.getItem(k), set: (k, v) => localStorage.setItem(k, v), remove: k => localStorage.removeItem(k), keys: () => Object.keys(localStorage) };
             } catch {
                 const mem = new Map();
-                return {
-                    get: k => mem.get(k) || null,
-                    set: (k, v) => mem.set(k, v),
-                    remove: k => mem.delete(k),
-                    keys: () => Array.from(mem.keys())
-                };
+                return { get: k => mem.get(k) || null, set: (k, v) => mem.set(k, v), remove: k => mem.delete(k), keys: () => Array.from(mem.keys()) };
             }
         }
 
         const storage = createStorage();
 
-        // 7. Cache Size Check Bug Fix
         function enforceCacheSize() {
             const keys = storage.keys().filter(k => k.startsWith(CACHE_CONFIG.PREFIX));
             if (keys.length <= CACHE_CONFIG.MAX_ENTRIES) return;
-
             const entries = keys.map(k => {
                 try {
                     const e = JSON.parse(storage.get(k));
                     return { key: k, lastAccessed: e?.lastAccessed || 0 };
-                } catch {
-                    return { key: k, lastAccessed: 0 };
-                }
+                } catch { return { key: k, lastAccessed: 0 }; }
             }).sort((a, b) => a.lastAccessed - b.lastAccessed);
-
             const overflow = entries.length - CACHE_CONFIG.MAX_ENTRIES;
-            for (let i = 0; i < overflow; i++) {
-                storage.remove(entries[i].key);
-            }
+            for (let i = 0; i < overflow; i++) storage.remove(entries[i].key);
         }
 
         function cacheSet(key, value) {
-            const entry = {
-                v: CACHE_CONFIG.VERSION,
-                value,
-                expiresAt: now() + CACHE_CONFIG.TTL_MS,
-                lastAccessed: now()
-            };
+            const entry = { v: CACHE_CONFIG.VERSION, value, expiresAt: now() + CACHE_CONFIG.TTL_MS, lastAccessed: now() };
             storage.set(CACHE_CONFIG.PREFIX + key, JSON.stringify(entry));
-            // 7. Correct cache size check trigger
             const cacheKeys = storage.keys().filter(k => k.startsWith(CACHE_CONFIG.PREFIX));
-            if (cacheKeys.length > CACHE_CONFIG.MAX_ENTRIES) {
-                enforceCacheSize();
-            }
+            if (cacheKeys.length > CACHE_CONFIG.MAX_ENTRIES) enforceCacheSize();
         }
 
         function cacheGet(key) {
@@ -361,18 +274,12 @@
             if (!raw) return null;
             try {
                 const entry = JSON.parse(raw);
-                if (entry.v !== CACHE_CONFIG.VERSION || now() > entry.expiresAt) {
-                    storage.remove(CACHE_CONFIG.PREFIX + key);
-                    return null;
-                }
+                if (entry.v !== CACHE_CONFIG.VERSION || now() > entry.expiresAt) { storage.remove(CACHE_CONFIG.PREFIX + key); return null; }
                 entry.expiresAt = now() + CACHE_CONFIG.TTL_MS;
                 entry.lastAccessed = now();
                 storage.set(CACHE_CONFIG.PREFIX + key, JSON.stringify(entry));
                 return entry.value;
-            } catch {
-                storage.remove(CACHE_CONFIG.PREFIX + key);
-                return null;
-            }
+            } catch { storage.remove(CACHE_CONFIG.PREFIX + key); return null; }
         }
 
         function cacheDelete(key) { storage.remove(CACHE_CONFIG.PREFIX + key); }
@@ -383,12 +290,8 @@
                 if (!key.startsWith(CACHE_CONFIG.PREFIX)) continue;
                 try {
                     const entry = JSON.parse(storage.get(key));
-                    if (!entry || entry.v !== CACHE_CONFIG.VERSION || now() > entry.expiresAt) {
-                        storage.remove(key);
-                    }
-                } catch {
-                    storage.remove(key);
-                }
+                    if (!entry || entry.v !== CACHE_CONFIG.VERSION || now() > entry.expiresAt) storage.remove(key);
+                } catch { storage.remove(key); }
             }
         }
 
@@ -399,18 +302,11 @@
                 try {
                     const e = JSON.parse(storage.get(k));
                     if (!e || now() > e.expiresAt) expired++;
-                } catch {
-                    expired++;
-                }
+                } catch { expired++; }
             }
-            return {
-                totalEntries: keys.length,
-                expiredEntries: expired,
-                maxEntries: CACHE_CONFIG.MAX_ENTRIES
-            };
+            return { totalEntries: keys.length, expiredEntries: expired, maxEntries: CACHE_CONFIG.MAX_ENTRIES };
         }
 
-        // Initialize Cache
         evictExpiredEntries();
 
         function useCacheStats() {
@@ -419,11 +315,29 @@
             return stats;
         }
 
-        // ==========================================
-        // SECTION 4: LOGIC ENGINES (Business Logic)
-        // ==========================================
+        // --- GLOBAL HELPER: Robust Vault Detection ---
+        function isInVault(item, libraryItems) {
+            // 1. Direct IMDb ID match (most reliable)
+            if (item.imdbID) {
+                const directMatch = libraryItems.some(lib => lib.imdbID === item.imdbID);
+                if (directMatch) return true;
+            }
 
-        // --- EPISODE PROGRESS ENGINE ---
+            // 2. Fallback: Fuzzy Title + Year match (for TMDB items missing IMDb IDs)
+            // Normalize current item
+            const normTitle = normalizeTitle(item.Title || item.title || '');
+            const year = extractYear(item);
+            
+            if (!normTitle) return false;
+
+            return libraryItems.some(lib => {
+                const libTitle = normalizeTitle(lib.Title || '');
+                const libYear = extractYear(lib);
+                // Require exact normalized title match and exact year match if both exist
+                return libTitle === normTitle && (year && libYear ? libYear == year : true);
+            });
+        }
+
         function resolveEpisodeState(episodeId, watchHistory) {
             const record = watchHistory?.[episodeId];
             if (!record) return { state: 'unwatched', progress: 0 };
@@ -433,33 +347,20 @@
         }
 
         function calculateEpisodeProgress({ episodes, watchHistory }) {
-            let watchedEpisodes = 0;
-            let lastWatched = null;
-            let nextToWatch = null;
-            let hasGaps = false;
-            let gapDetected = false;
-
+            let watchedEpisodes = 0, lastWatched = null, nextToWatch = null, hasGaps = false, gapDetected = false;
             if (!episodes || !Array.isArray(episodes)) return null;
-
             for (const ep of episodes) {
                 const state = resolveEpisodeState(ep.id, watchHistory);
                 if (state.state === 'watched') {
                     watchedEpisodes++;
                     lastWatched = { episodeId: ep.id, season: ep.season, episode: ep.episode };
                 } else {
-                    if (watchedEpisodes > 0 && !gapDetected) {
-                        hasGaps = true;
-                        gapDetected = true;
-                    }
-                    if (!nextToWatch) {
-                        nextToWatch = { episodeId: ep.id, season: ep.season, episode: ep.episode };
-                    }
+                    if (watchedEpisodes > 0 && !gapDetected) { hasGaps = true; gapDetected = true; }
+                    if (!nextToWatch) nextToWatch = { episodeId: ep.id, season: ep.season, episode: ep.episode };
                 }
             }
-
             const totalEpisodes = episodes.length;
             const completionPercent = totalEpisodes > 0 ? Math.round((watchedEpisodes / totalEpisodes) * 100) : 0;
-
             return { watchedEpisodes, totalEpisodes, completionPercent, lastWatched, nextToWatch, isCompleted: watchedEpisodes === totalEpisodes, hasGaps };
         }
 
@@ -467,10 +368,7 @@
             const seasons = {};
             for (const ep of episodes) {
                 const state = resolveEpisodeState(ep.id, watchHistory);
-                // 5. Fix optional chaining assignment
-                if (!seasons[ep.season]) {
-                    seasons[ep.season] = { season: ep.season, watched: 0, skipped: 0, total: 0 };
-                }
+                if (!seasons[ep.season]) seasons[ep.season] = { season: ep.season, watched: 0, skipped: 0, total: 0 };
                 seasons[ep.season].total++;
                 if (state.state === 'watched') seasons[ep.season].watched++;
                 else seasons[ep.season].skipped++;
@@ -492,9 +390,7 @@
             if (!episodes || !Array.isArray(episodes)) return [];
             const seasons = {};
             for (const ep of episodes) {
-                if (!seasons[ep.season]) {
-                    seasons[ep.season] = { season: ep.season, watched: 0, partial: 0, total: 0 };
-                }
+                if (!seasons[ep.season]) seasons[ep.season] = { season: ep.season, watched: 0, partial: 0, total: 0 };
                 const state = resolveEpisodeState(ep.id, watchHistory);
                 seasons[ep.season].total++;
                 if (state.state === 'watched') seasons[ep.season].watched++;
@@ -503,7 +399,6 @@
             return Object.values(seasons).map(s => ({ ...s, completionPercent: s.total ? Math.round((s.watched / s.total) * 100) : 0 }));
         }
 
-        // --- WEIGHTED RATING ENGINE ---
         function extractUserRatings(item) {
             if (!item.userMeta?.ratings) return [];
             return Object.values(item.userMeta.ratings)
@@ -522,7 +417,6 @@
             const { minMinutes = 20, maxMinutesCap = null } = options;
             let weightedSum = 0, totalWeight = 0, contributingItems = 0;
             const breakdown = [];
-
             for (const r of ratings) {
                 if (typeof r.rating !== 'number' || r.rating < 1 || r.rating > 10 || typeof r.minutesWatched !== 'number' || r.minutesWatched <= 0) continue;
                 let minutes = r.minutesWatched;
@@ -536,12 +430,10 @@
                 contributingItems++;
                 breakdown.push({ imdbID: r.imdbID, rating: r.rating, minutesWatched: minutes, confidence: Number(confidence.toFixed(2)), weight: Number(weight.toFixed(2)), contribution: Number(contribution.toFixed(2)) });
             }
-
             if (totalWeight === 0) return { weightedRating: 0, contributingItems: 0, breakdown: [] };
             return { weightedRating: Number((weightedSum / totalWeight).toFixed(2)), contributingItems, breakdown };
         }
 
-        // --- GENRE INTELLIGENCE ENGINE ---
         function extractGenres(genres) {
             if (!genres) return [];
             if (Array.isArray(genres)) return genres.map(g => g.toLowerCase().trim()).filter(Boolean);
@@ -559,7 +451,6 @@
             const { useRecency = false, recencyHalfLifeDays = 180 } = options;
             const distribution = {};
             let totalWeight = 0;
-
             for (const item of items) {
                 const genres = extractGenres(item.genres);
                 if (genres.length === 0) continue;
@@ -604,7 +495,6 @@
             return itemGenres.reduce((score, g) => score + (preferredGenres.includes(g) ? 1 : 0), 0);
         }
 
-        // --- ACTOR POPULARITY ENGINE ---
         function buildProgressMap(items) {
             const map = {};
             items.forEach(item => {
@@ -693,7 +583,6 @@
             }, 0);
         }
 
-        // --- SEARCH & CANONICALIZATION ENGINE ---
         function normalizeQuery(query) {
             if (!query) return '';
             return query.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9\s]/g, ' ').replace(/\b(the|a|an)\b/g, ' ').replace(/\s+/g, ' ').trim();
@@ -714,16 +603,6 @@
             if (!year) return '';
             const y = String(year).trim();
             return /^\d{4}$/.test(y) ? y : '';
-        }
-
-        function buildStableCacheKey({ type, query, year }) {
-            const version = 'v2';
-            const t = normalizeType(type);
-            const q = canonicalizeQuery(query);
-            const y = normalizeYear(year);
-            const semanticKey = `${t}|${q}|${y}`;
-            const hash = hashString(semanticKey);
-            return [version, t, q, y, hash].join('|');
         }
 
         function normalizeTitle(str) { return (str || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim(); }
@@ -750,6 +629,16 @@
                 return parseInt(item.imdbVotes.replace(/,/g, ''), 10) || 0;
             }
             return Math.max(0, 100 - index);
+        }
+
+        function extractVoteCount(item) {
+            if (item.raw?.imdbVotes) {
+                return parseInt(item.raw.imdbVotes.replace(/,/g, ''), 10) || 0;
+            }
+            if (typeof item.raw?.vote_count === 'number') {
+                return item.raw.vote_count;
+            }
+            return 0;
         }
 
         function scoreCandidate({ item, query, targetYear, titleKey = 'title', index }) {
@@ -782,23 +671,6 @@
             return { item, score, reasons };
         }
 
-        function selectBestCandidateEnhanced({ results, query, year = null, titleKey = 'title', debug = false }) {
-            if (!Array.isArray(results) || results.length === 0) return null;
-            const scored = results.map((item, index) => scoreCandidate({ item, query, targetYear: year, titleKey, index }));
-            scored.sort((a, b) => b.score - a.score);
-            const winner = scored[0];
-            if (debug) {
-                return {
-                    selected: winner.item,
-                    score: winner.score,
-                    reasons: winner.reasons,
-                    ranking: scored.map(s => ({ title: s.item[titleKey], year: extractYear(s.item), score: s.score, reasons: s.reasons }))
-                };
-            }
-            return winner.item;
-        }
-
-        // --- ASIAN REGISTRY & DETECTION ---
         async function getExternalMapping(imdbID, supabase) {
             const { data } = await supabase.from('imdb_external_map').select('source, source_id').eq('imdb_id', imdbID).single();
             return data || null;
@@ -870,7 +742,6 @@
             return { id: resolved.source_id, title: resolved.title, rating: resolved.rating, votes: resolved.votes, raw: resolved.payload, source: preferredSource, _registry_source: 'api' };
         }
 
-        function normalizeOrigin(str) { return (str || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
         function containsAny(haystack, needles) { return needles.some(term => haystack.includes(term)); }
 
         function scoreAsianOrigin({ Country, Language, Genre }) {
@@ -895,6 +766,8 @@
             return { score, reasons };
         }
 
+        function normalizeOrigin(str) { return (str || '').toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
+
         function detectAsianOrigin(item, options = {}) {
             const { threshold = 50, debug = false } = options;
             const { score, reasons } = scoreAsianOrigin(item);
@@ -903,7 +776,6 @@
             return isAsian;
         }
 
-        // --- ENRICHMENT PIPELINE ---
         function classifyForEnrichment(item) {
             return {
                 isSeries: item.Type === 'series',
@@ -1063,7 +935,7 @@
                 source,
                 title: raw.title || raw.name || raw.Title,
                 year: raw.premiered?.slice(0, 4) || raw.release_date?.slice(0, 4) || raw.first_air_date?.slice(0, 4) || raw.Year || null,
-                imdbID: raw.externals?.imdb || raw.imdbID || null,
+                imdbID: raw.external_ids?.imdb_id || raw.externals?.imdb || raw.imdbID || null, // Updated to look for injected ID
                 tmdbID: source === 'tmdb' ? raw.id : null,
                 plot: raw.summary?.replace(/<[^>]+>/g, '') || raw.overview || raw.Plot || null,
                 poster: raw.image?.original || (raw.poster_path ? `https://image.tmdb.org/t/p/w500${raw.poster_path}` : raw.Poster) || null,
@@ -1075,10 +947,13 @@
             };
         }
 
+        // 2. Fix Clustering Logic (Soft Key Fallback)
         function reconcile(candidates) {
-            const clusters = [];
-            const processed = new Set();
             const imdbMap = {};
+            const softMap = {};
+            const processed = new Set();
+
+            // 1. Cluster by IMDb ID
             candidates.forEach((c, idx) => {
                 if (c.imdbID) {
                     if (!imdbMap[c.imdbID]) imdbMap[c.imdbID] = [];
@@ -1086,11 +961,17 @@
                     processed.add(idx);
                 }
             });
-            Object.values(imdbMap).forEach(cluster => clusters.push(cluster));
+
+            // 2. Cluster remaining by Soft Key (Title + Year + Type)
             candidates.forEach((c, idx) => {
-                if (!processed.has(idx)) clusters.push([c]);
+                if (processed.has(idx)) return;
+                const nTitle = normalizeTitle(c.title);
+                const key = `${nTitle}|${c.year || 'NA'}|${c.type}`;
+                if (!softMap[key]) softMap[key] = [];
+                softMap[key].push(c);
             });
-            return clusters;
+
+            return [...Object.values(imdbMap), ...Object.values(softMap)];
         }
 
         function mergeBest(cluster) {
@@ -1107,7 +988,8 @@
                 tmdb: primary.tmdbID ? { id: primary.tmdbID } : null,
                 sourcesUsed: cluster.map(c => c.source),
                 confidence: primary.score,
-                _searchDebug: { score: primary.score, reasons: primary.reasons || [] }
+                _searchDebug: { score: primary.score, reasons: primary.reasons || [] },
+                raw: primary.raw // Ensure raw data is passed for vote extraction
             };
         }
 
@@ -1125,20 +1007,33 @@
             const wrappedResults = await Promise.allSettled(wrappedPromises);
             const rawCandidates = [];
             
-            wrappedResults.forEach(res => {
+            // 1. Fix #1: Async TMDB ID Fetching inside search loop
+            for (const res of wrappedResults) {
                 if (res.status === 'fulfilled' && res.value?.v && !res.value.v.error) {
                     const val = res.value.v;
                     let list = [];
-                    if (res.value.s === 'tmdb') list = val.results || [];
+                    if (res.value.s === 'tmdb') {
+                        list = val.results || [];
+                        // Async fetch external IDs for TMDB results
+                        if (apiKeys.tmdb) {
+                            list = await Promise.all(list.map(async (item) => {
+                                const t = item.media_type === 'tv' || item.first_air_date ? 'tv' : 'movie';
+                                const ext = await safeFetch(`https://api.themoviedb.org/3/${t}/${item.id}/external_ids?api_key=${apiKeys.tmdb}`);
+                                if (ext?.imdb_id) item.external_ids = { imdb_id: ext.imdb_id };
+                                return item;
+                            }));
+                        }
+                    }
                     else if (res.value.s === 'tvmaze') list = val.map(v => v.show) || [];
                     else if (res.value.s === 'omdb') list = val.Search || [];
                     else if (res.value.s === 'jikan') list = val.data || [];
                     else if (res.value.s === 'mdl') list = val.results || [];
+                    
                     list.forEach(item => rawCandidates.push(normalizeCandidate(item, res.value.s)));
                 }
-            });
+            }
 
-            if (rawCandidates.length === 0) return [];
+            if (rawCandidates.length === 0) return { primary: [], more: [] };
             rawCandidates.forEach((c, index) => {
                 const result = scoreCandidate({ item: c, query: q, targetYear: year, titleKey: 'title', index: index });
                 c.score = result.score;
@@ -1147,7 +1042,27 @@
 
             const clusters = reconcile(rawCandidates);
             const mergedResults = clusters.map(cluster => mergeBest(cluster));
-            return mergedResults.sort((a, b) => b.confidence - a.confidence);
+            
+            // --- ENHANCED RANKING & SPLITTING LOGIC ---
+            mergedResults.forEach(item => {
+                item.voteCount = extractVoteCount(item);
+                item.hasPoster = !!item.Poster && item.Poster !== "N/A";
+                // Elite ranking calculation: log(votes)*2 + confidence
+                item.eliteScore = (Math.log(item.voteCount || 1) * 2) + item.confidence;
+            });
+
+            const main = mergedResults
+                .filter(item => item.voteCount >= 1000 && item.hasPoster)
+                .sort((a, b) => b.eliteScore - a.eliteScore); // Primary sorted by elite ranking
+
+            const more = mergedResults
+                .filter(item => item.voteCount < 1000 || !item.hasPoster)
+                .sort((a, b) => b.voteCount - a.voteCount); // Secondary sorted by raw votes
+
+            return {
+                primary: main,
+                more: more
+            };
         }
 
         // ==========================================
@@ -1324,7 +1239,6 @@
                         </div>
                     )}
                     
-                    {/* 1. Critical JSX Syntax Error Fix */}
                     {resumeTarget && (
                         <button
                             onClick={(e) => {
@@ -1897,8 +1811,61 @@
             );
         };
 
-        const SearchOverlay = ({ isOpen, onClose, query, setQuery, results, onResultClick, isLoading, searchType, setSearchType }) => {
+        const SearchOverlay = ({ isOpen, onClose, query, setQuery, results, onResultClick, isLoading, searchType, setSearchType, vault, isAdmin, onSuggest, onAdd }) => {
             if (!isOpen) return null;
+            
+            // Collect all library items for robust check
+            const libraryItems = useMemo(() => [...Object.values(vault.watched), ...Object.values(vault.watchlist)], [vault]);
+
+            const renderResultCard = (item, idx) => {
+                const inVault = isInVault(item, libraryItems);
+                
+                return (
+                    <div key={`${item.imdbID || item.id}-${item._sourceMeta?.source || 'unknown'}-${idx}`} onClick={() => onResultClick(item)} className="group p-4 rounded-[2rem] bg-white/5 border border-white/5 hover:border-indigo-500/50 hover:bg-white/10 transition-all cursor-pointer flex gap-6 relative overflow-hidden">
+                        <div className="w-24 aspect-[2/3] rounded-2xl overflow-hidden bg-slate-800 shrink-0 shadow-lg relative">
+                            <img src={getHighResPoster(item.Poster, 200)} width="200" height="300" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
+                            {item.confidence > 50 && <div className="absolute top-1 right-1 bg-green-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">{Math.round(item.confidence)}% Match</div>}
+                        </div>
+                        <div className="flex-1 py-2 flex flex-col justify-center relative z-10">
+                            <div className="flex items-start justify-between"><h4 className="text-xl font-black text-white group-hover:text-indigo-400 transition-colors leading-tight line-clamp-2">{item.Title}</h4></div>
+                            <p className="text-slate-500 font-bold uppercase tracking-widest text-[10px] mt-2">{item.Year} • {item.Type}</p>
+                            
+                            {/* --- ACTION SECTION REPLACEMENT --- */}
+                            {inVault ? (
+                                <div className="mt-3 bg-emerald-600/20 text-emerald-400 px-4 py-2 rounded-xl text-sm font-semibold border border-emerald-500/30 text-center">
+                                    Already in the Vault
+                                </div>
+                            ) : isAdmin ? (
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        onAdd(item.imdbID);
+                                    }}
+                                    className="mt-3 w-full bg-indigo-600 hover:bg-indigo-500 text-white py-2 rounded-xl font-semibold transition shadow-lg shadow-indigo-600/20"
+                                >
+                                    Add to Library
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        onSuggest(item);
+                                    }}
+                                    className="mt-3 w-full bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 py-2 rounded-xl font-semibold border border-amber-500/30 transition"
+                                >
+                                    Suggest to Admin
+                                </button>
+                            )}
+
+                            {item._searchDebug && (
+                                <div className="mt-2 text-[10px] text-slate-400 space-y-0.5">{item._searchDebug.reasons.slice(0, 3).map(r => (<div key={r}>• {humanizeReason(r)}</div>))}</div>
+                            )}
+                            <div className="mt-3 flex flex-wrap gap-2">{item.sourcesUsed?.slice(0, 3).map(s => (<span key={s} className="px-2 py-0.5 rounded bg-white/5 text-[9px] uppercase font-bold text-slate-400">{s}</span>))}</div>
+                        </div>
+                    </div>
+                );
+            };
+
             return (
                 <div className="fixed inset-0 z-[150] bg-vault-950/95 backdrop-blur-xl animate-fade-in p-4 lg:p-12 overflow-y-auto">
                     <div className="max-w-4xl mx-auto flex flex-col h-full">
@@ -1917,25 +1884,21 @@
                                 ))}
                             </div>
                         </div>
-                        <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {results.map((item, idx) => (
-                                <div key={`${item.imdbID || item.id}-${item._sourceMeta?.source || 'unknown'}-${idx}`} onClick={() => onResultClick(item)} className="group p-4 rounded-[2rem] bg-white/5 border border-white/5 hover:border-indigo-500/50 hover:bg-white/10 transition-all cursor-pointer flex gap-6 relative overflow-hidden">
-                                    <div className="w-24 aspect-[2/3] rounded-2xl overflow-hidden bg-slate-800 shrink-0 shadow-lg relative">
-                                        <img src={getHighResPoster(item.Poster, 200)} width="200" height="300" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
-                                        {item.confidence > 50 && <div className="absolute top-1 right-1 bg-green-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">{Math.round(item.confidence)}% Match</div>}
-                                    </div>
-                                    <div className="flex-1 py-2 flex flex-col justify-center relative z-10">
-                                        <div className="flex items-start justify-between"><h4 className="text-xl font-black text-white group-hover:text-indigo-400 transition-colors leading-tight line-clamp-2">{item.Title}</h4></div>
-                                        <p className="text-slate-500 font-bold uppercase tracking-widest text-[10px] mt-2">{item.Year} • {item.Type}</p>
-                                        {item._searchDebug && (
-                                            <div className="mt-2 text-[10px] text-slate-400 space-y-0.5">{item._searchDebug.reasons.slice(0, 3).map(r => (<div key={r}>• {humanizeReason(r)}</div>))}</div>
-                                        )}
-                                        <div className="mt-3 flex flex-wrap gap-2">{item.sourcesUsed?.slice(0, 3).map(s => (<span key={s} className="px-2 py-0.5 rounded bg-white/5 text-[9px] uppercase font-bold text-slate-400">{s}</span>))}</div>
-                                        <div className="mt-3 flex gap-2">{item.inVault && <Badge color="green">In Vault</Badge>}</div>
+                        <div className="flex-1">
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {results.primary && results.primary.map(renderResultCard)}
+                            </div>
+                            
+                            {results.more && results.more.length > 0 && (
+                                <div className="mt-8">
+                                    <h3 className="mb-4 text-sm text-slate-400 uppercase tracking-wider font-bold border-b border-white/10 pb-2">More Results</h3>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        {results.more.map(renderResultCard)}
                                     </div>
                                 </div>
-                            ))}
-                            {query.length > 2 && results.length === 0 && !isLoading && (
+                            )}
+
+                            {query.length > 2 && (!results.primary?.length && !results.more?.length) && !isLoading && (
                                 <div className="col-span-full py-20 text-center">
                                     <h3 className="text-2xl font-black text-slate-700">No matches found</h3>
                                     <p className="text-slate-500 mt-2 font-medium">We checked TMDB, OMDb, TVMaze, Jikan & MDL.</p>
@@ -2069,6 +2032,27 @@
                 await supabase.from('content_suggestions').update({ status: 'rejected', updated_at: new Date() }).eq('id', item.id);
             };
 
+            // --- New Handler: Suggestion ---
+            const handleSuggestToAdmin = async (item) => {
+                if (!session?.user) return alert("Please sign in to make suggestions.");
+                
+                const { error } = await supabase.from('suggestions').insert({
+                    title: item.Title,
+                    imdb_id: item.imdbID,
+                    year: item.Year,
+                    poster: item.Poster,
+                    suggested_by: session.user.id,
+                    status: 'pending'
+                });
+
+                if (error) {
+                    alert("Error sending suggestion: " + error.message);
+                } else {
+                    alert("Suggestion sent to Admin!");
+                    setIsSearchOpen(false);
+                }
+            };
+
             function adminClearCache() {
                 if (!isAdmin) return;
                 clearAllCache();
@@ -2082,7 +2066,8 @@
 
             const [isSearchOpen, setIsSearchOpen] = useState(false);
             const [searchQuery, setSearchQuery] = useState('');
-            const [searchResults, setSearchResults] = useState([]);
+            // --- UPDATED STATE: Handle structured results ---
+            const [searchResults, setSearchResults] = useState({ primary: [], more: [] });
             const [isSearchLoading, setIsSearchLoading] = useState(false);
             const [searchType, setSearchType] = useState('all');
             const [activeFilter, setActiveFilter] = useState('all'); 
@@ -2104,11 +2089,19 @@
                 if (!query || query.length < 3) return;
                 setIsSearchLoading(true);
                 try {
+                    // --- UPDATED LOGIC: Handle structured return ---
                     const results = await smartSearch(query, apiKeys, searchType);
-                    setSearchResults(results.map(item => ({
+                    
+                    const processList = (list) => list.map(item => ({
                         ...item,
-                        inVault: !!(vault.watched[item.imdbID] || vault.watchlist[item.imdbID])
-                    })));
+                        // Use global helper instead of simple ID check
+                        inVault: isInVault(item, allVaultItems)
+                    }));
+
+                    setSearchResults({
+                        primary: processList(results.primary),
+                        more: processList(results.more)
+                    });
                 } catch (e) { console.error(e); }
                 setIsSearchLoading(false);
             };
@@ -2397,7 +2390,22 @@
                     </main>
 
                     <DetailModal item={selectedItem} onClose={() => setSelectedItem(null)} onUpdateStatus={toggleStatus} onRemove={removeFromVault} isAdmin={isAdmin} watchHistory={vault.watched} topActors={topActors} />
-                    <SearchOverlay isOpen={isSearchOpen} onClose={() => setIsSearchOpen(false)} query={searchQuery} setQuery={setSearchQuery} results={searchResults} onResultClick={(item) => item.inVault ? setSelectedItem(vault.watched[item.imdbID] || vault.watchlist[item.imdbID]) : addToVault(item.imdbID)} isLoading={isSearchLoading} searchType={searchType} setSearchType={setSearchType} />
+                    <SearchOverlay 
+                        isOpen={isSearchOpen} 
+                        onClose={() => setIsSearchOpen(false)} 
+                        query={searchQuery} 
+                        setQuery={setSearchQuery} 
+                        results={searchResults} 
+                        onResultClick={(item) => isInVault(item, allVaultItems) ? setSelectedItem(vault.watched[item.imdbID] || vault.watchlist[item.imdbID]) : null} 
+                        isLoading={isSearchLoading} 
+                        searchType={searchType} 
+                        setSearchType={setSearchType}
+                        // --- New Props for Actions ---
+                        vault={vault}
+                        isAdmin={isAdmin}
+                        onSuggest={handleSuggestToAdmin}
+                        onAdd={addToVault}
+                    />
                     <AdminSuggestionsModal isOpen={isAdminSuggestionsOpen} onClose={() => setIsAdminSuggestionsOpen(false)} suggestions={adminSuggestions} onApprove={approveSuggestion} onReject={rejectSuggestion} />
                     
                     {isSettingsOpen && (

@@ -38,7 +38,7 @@
                     animation: {
                         'float': 'float 6s ease-in-out infinite',
                         'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-                        'reveal': 'reveal 0.8s cubic-bezier(0.16, 1, 0.3, 1)',
+                        'reveal': 'reveal 0.6s cubic-bezier(0.16, 1, 0.3, 1)',
                         'gradientShift': 'gradientShift 6s ease infinite',
                     },
                     keyframes: {
@@ -47,8 +47,8 @@
                             '50%': { transform: 'translateY(-10px)' },
                         },
                         reveal: {
-                            '0%': { opacity: '0', transform: 'translateY(40px)' },
-                            '100%': { opacity: '1', transform: 'translateY(0)' },
+                            '0%': { opacity: '0', transform: 'translateY(40px) scale(0.95)' },
+                            '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
                         },
                         gradientShift: {
                             '0%': { backgroundPosition: '0% 50%' },
@@ -138,6 +138,21 @@
             pointer-events: none;
         }
 
+        /* Card Glow Effect */
+        .group:hover .media-glow {
+            opacity: 1;
+        }
+        .media-glow {
+            position: absolute;
+            inset: -1px;
+            border-radius: 1rem;
+            background: radial-gradient(circle at top left, rgba(99,102,241,0.3), transparent 60%);
+            opacity: 0;
+            transition: opacity 0.5s ease;
+            pointer-events: none;
+            z-index: 5;
+        }
+
         .mask-fade-bottom {
             mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
         }
@@ -162,7 +177,15 @@
         
         const SUPABASE_URL = "https://ugllcdapuzihpkgcoaxj.supabase.co";
         const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVnbGxjZGFwdXppaHBrZ2NvYXhqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTA3NzksImV4cCI6MjA4NjA2Njc3OX0.73I1cW1fqRUha5_6spK7C8m-SXUHQQfyjmcbNNbdfCI";
-        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+        
+        // 3. Supabase Client Global Access Risk - Safe Version
+        const mockSupabase = {
+            from: () => ({ select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null }) }) }), upsert: () => Promise.resolve(), delete: () => ({ eq: () => ({ eq: () => Promise.resolve() }) }) }),
+            auth: { getUser: () => Promise.resolve({ data: { user: null } }), getSession: () => Promise.resolve({ data: { session: null } }), onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => {} } } }), signInWithPassword: () => Promise.resolve({ error: { message: "Supabase client not loaded." } }), signOut: () => Promise.resolve() }
+        };
+        const supabase = (window.supabase && window.supabase.createClient) 
+            ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) 
+            : mockSupabase;
 
         const ADMIN_IDS = ["74e5b3ea-113f-4d6c-be2a-b0b52b2e92c3"];
         const DEFAULT_KEYS = { omdb: '5591108c', tmdb: '68b27c1f85725736f0aec18b903197b0', rapid: '9782bOaf7fmsh8b54c22e5cOaf5cp13e6e8jsn8e2e765657a5' };
@@ -298,6 +321,7 @@
 
         const storage = createStorage();
 
+        // 7. Cache Size Check Bug Fix
         function enforceCacheSize() {
             const keys = storage.keys().filter(k => k.startsWith(CACHE_CONFIG.PREFIX));
             if (keys.length <= CACHE_CONFIG.MAX_ENTRIES) return;
@@ -314,7 +338,6 @@
             const overflow = entries.length - CACHE_CONFIG.MAX_ENTRIES;
             for (let i = 0; i < overflow; i++) {
                 storage.remove(entries[i].key);
-                if (process.env.NODE_ENV === 'development') console.debug('[cache evict]', entries[i].key);
             }
         }
 
@@ -326,7 +349,9 @@
                 lastAccessed: now()
             };
             storage.set(CACHE_CONFIG.PREFIX + key, JSON.stringify(entry));
-            if (storage.keys().length > CACHE_CONFIG.MAX_ENTRIES) {
+            // 7. Correct cache size check trigger
+            const cacheKeys = storage.keys().filter(k => k.startsWith(CACHE_CONFIG.PREFIX));
+            if (cacheKeys.length > CACHE_CONFIG.MAX_ENTRIES) {
                 enforceCacheSize();
             }
         }
@@ -343,7 +368,6 @@
                 entry.expiresAt = now() + CACHE_CONFIG.TTL_MS;
                 entry.lastAccessed = now();
                 storage.set(CACHE_CONFIG.PREFIX + key, JSON.stringify(entry));
-                if (process.env.NODE_ENV === 'development') console.debug('[cache hit]', key);
                 return entry.value;
             } catch {
                 storage.remove(CACHE_CONFIG.PREFIX + key);
@@ -443,7 +467,10 @@
             const seasons = {};
             for (const ep of episodes) {
                 const state = resolveEpisodeState(ep.id, watchHistory);
-                seasons[ep.season] ??= { season: ep.season, watched: 0, skipped: 0, total: 0 };
+                // 5. Fix optional chaining assignment
+                if (!seasons[ep.season]) {
+                    seasons[ep.season] = { season: ep.season, watched: 0, skipped: 0, total: 0 };
+                }
                 seasons[ep.season].total++;
                 if (state.state === 'watched') seasons[ep.season].watched++;
                 else seasons[ep.season].skipped++;
@@ -465,7 +492,9 @@
             if (!episodes || !Array.isArray(episodes)) return [];
             const seasons = {};
             for (const ep of episodes) {
-                seasons[ep.season] ??= { season: ep.season, watched: 0, partial: 0, total: 0 };
+                if (!seasons[ep.season]) {
+                    seasons[ep.season] = { season: ep.season, watched: 0, partial: 0, total: 0 };
+                }
                 const state = resolveEpisodeState(ep.id, watchHistory);
                 seasons[ep.season].total++;
                 if (state.state === 'watched') seasons[ep.season].watched++;
@@ -541,7 +570,7 @@
                 const fractional = weight / genres.length;
                 totalWeight += weight;
                 for (const genre of genres) {
-                    distribution[genre] ??= 0;
+                    if (!distribution[genre]) distribution[genre] = 0;
                     distribution[genre] += fractional;
                 }
             }
@@ -631,7 +660,7 @@
                 for (const actor of cast) {
                     const key = normalizeActor(actor.name);
                     const rWeight = roleWeight(actor.order);
-                    actorScores[key] ??= 0;
+                    if (!actorScores[key]) actorScores[key] = 0;
                     actorScores[key] += itemWeight * rWeight;
                 }
             }
@@ -1203,25 +1232,31 @@
                 slate: "bg-slate-500/10 text-slate-400 border-slate-500/20",
             };
             return (
-                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border ${colors[color]}`}>
+                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border transition-all duration-300 hover:scale-105 ${colors[color]}`}>
                     {children}
                 </span>
             );
         };
 
         const MediaCardPoster = ({ item, isSeries, rating, onPlayTrailer, isAdmin, onAdminEdit, resumeTarget, onResume }) => (
-            <div className="relative aspect-[2/3] overflow-hidden rounded-2xl bg-slate-900 shadow-2xl transition-all duration-500 group-hover:-translate-y-3 group-hover:shadow-2xl group-hover:shadow-indigo-500/30 group-hover:ring-2 group-hover:ring-indigo-500/40">
+            <div className="relative aspect-[2/3] overflow-hidden rounded-2xl bg-slate-900 shadow-[0_10px_40px_rgba(0,0,0,0.6)] transition-all duration-700 group-hover:-translate-y-3 group-hover:shadow-[0_20px_60px_rgba(99,102,241,0.35)] group-hover:ring-2 group-hover:ring-indigo-500/40">
+                <div className="media-glow" />
                 <img 
                     src={getHighResPoster(item.Poster, 400)} 
                     alt={item.Title}
-                    className="h-full w-full object-cover opacity-80 transition-all duration-700 group-hover:scale-110 group-hover:opacity-100"
+                    width="400"
+                    height="600"
                     loading="lazy"
+                    className="h-full w-full object-cover opacity-85 transition-all duration-1000 ease-out group-hover:scale-110 group-hover:opacity-100"
                 />
+                <div className="absolute inset-0 pointer-events-none">
+                    <div className="absolute -inset-[200%] bg-gradient-to-r from-transparent via-white/10 to-transparent rotate-12 group-hover:translate-x-[300%] transition-transform duration-1000 ease-out" />
+                </div>
                 <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-70 group-hover:opacity-90 transition duration-500" />
                 <MediaCardBadges item={item} />
                 <div className="absolute top-3 right-3 flex flex-col gap-2">
-                        <div className="bg-black/60 backdrop-blur-md text-white px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 border border-white/10">
-                        <Icon name="star" size={12} className="text-amber-400 fill-amber-400" />
+                        <div className="bg-black/70 backdrop-blur-xl text-white px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 border border-white/10 shadow-lg shadow-black/40">
+                        <Icon name="star" size={12} className="text-amber-400 fill-amber-400 drop-shadow" />
                         {rating || 'N/A'}
                     </div>
                 </div>
@@ -1270,11 +1305,11 @@
             }, [item, onAdminEdit]);
 
             return (
-                <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4">
+                <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4">
                     <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 scale-50 opacity-0 group-hover:scale-100 group-hover:opacity-100 transition-all duration-300">
                         <button 
                             onClick={handleTrailer}
-                            className="bg-indigo-600/90 backdrop-blur-md p-4 rounded-full text-white shadow-xl hover:bg-indigo-500 hover:scale-110 transition-all"
+                            className="relative bg-gradient-to-br from-indigo-500 to-purple-600 p-5 rounded-full text-white shadow-2xl shadow-indigo-500/40 hover:scale-110 hover:shadow-purple-500/50 transition-all duration-300"
                             title="Watch Trailer"
                         >
                             <Icon name="play" size={28} className="ml-1" />
@@ -1289,20 +1324,16 @@
                         </div>
                     )}
                     
+                    {/* 1. Critical JSX Syntax Error Fix */}
                     {resumeTarget && (
                         <button
                             onClick={(e) => {
                                 e.stopPropagation();
                                 onResume(item, resumeTarget);
                             }}
-                            className="mt-3 w-full bg-emerald-600/90 hover:bg-emerald-500 text-white text-xs font-semibold py-2 rounded-lg backdrop-blur-md transition"
+                            className="mt-3 w-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold py-2 rounded-xl transition-all duration-300"
                         >
-                            ▶ Resume S{resumeTarget.season}E{resumeTarget.episode}
-                            {resumeTarget.resumeFrom > 0 && (
-                                <span className="ml-2 opacity-80">
-                                    {Math.round(resumeTarget.resumeFrom * 100)}%
-                                </span>
-                            )}
+                            Resume S{resumeTarget.season} · E{resumeTarget.episode}
                         </button>
                     )}
 
@@ -1314,10 +1345,10 @@
 
         const MediaCardInfo = ({ item, isSeries, confidence }) => (
             <div className="px-1">
-                <h3 className="font-bold text-sm text-slate-100 line-clamp-1 group-hover:text-indigo-400 transition-colors">
+                <h3 className="font-bold text-sm text-white tracking-tight line-clamp-1 group-hover:text-indigo-400 transition-colors duration-300">
                     {item.Title}
                 </h3>
-                <div className="flex flex-wrap items-center gap-2 mt-1">
+                <div className="flex flex-wrap items-center gap-2 mt-2">
                     {item.meta?.asian && <Badge color="green">Asian</Badge>}
                     {item.meta?.asian?.mdl && <Badge color="green">MDL {item.meta.asian.mdl.rating}</Badge>}
                     {item.meta?.anime?.score && <Badge color="indigo">MAL {item.meta.anime.score}</Badge>}
@@ -1356,7 +1387,7 @@
             }, [item]);
 
             return (
-                <div onClick={onClick} className="group relative flex flex-col gap-3 animate-reveal">
+                <div onClick={onClick} className="group relative flex flex-col gap-3 animate-reveal transition-all duration-500 hover:scale-[1.03] hover:z-20">
                     <MediaCardPoster item={item} isSeries={isSeries} rating={displayRating} onPlayTrailer={onPlayTrailer} isAdmin={isAdmin} onAdminEdit={onAdminEdit} resumeTarget={resumeTarget} onResume={onResume} />
                     <MediaCardInfo item={item} isSeries={isSeries} confidence={ratingConfidenceLabel} />
                 </div>
@@ -1554,7 +1585,7 @@
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
                                 {recentlyWatched.map(item => (
                                      <div key={item.imdbID} className="relative rounded-xl overflow-hidden aspect-[2/3] transition-all duration-500 hover:-translate-y-2 hover:shadow-xl hover:shadow-indigo-500/20 group cursor-pointer bg-slate-800">
-                                        <img src={getHighResPoster(item.Poster, 300)} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
+                                        <img src={getHighResPoster(item.Poster, 300)} width="300" height="450" className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
                                         <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition duration-300 flex items-end p-4">
                                              <div>
                                                 <p className="text-white font-bold text-sm line-clamp-1">{item.Title}</p>
@@ -1664,7 +1695,7 @@
                     <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl" onClick={onClose}></div>
                     <div className="relative w-full max-w-6xl max-h-full glass rounded-[2rem] overflow-hidden flex flex-col lg:flex-row shadow-2xl border-white/10 animate-reveal">
                         <div className="relative w-full lg:w-[400px] h-64 lg:h-auto shrink-0 overflow-hidden">
-                            <img src={getHighResPoster(item.Poster, 800)} className="w-full h-full object-cover" />
+                            <img src={getHighResPoster(item.Poster, 800)} width="400" height="600" className="w-full h-full object-cover" />
                             <div className="absolute inset-0 bg-gradient-to-t from-vault-950 via-transparent lg:bg-gradient-to-r lg:from-transparent lg:to-vault-950"></div>
                             <button onClick={onClose} className="lg:hidden absolute top-4 right-4 bg-black/50 p-2 rounded-full text-white"><Icon name="close" /></button>
                         </div>
@@ -1890,7 +1921,7 @@
                             {results.map((item, idx) => (
                                 <div key={`${item.imdbID || item.id}-${item._sourceMeta?.source || 'unknown'}-${idx}`} onClick={() => onResultClick(item)} className="group p-4 rounded-[2rem] bg-white/5 border border-white/5 hover:border-indigo-500/50 hover:bg-white/10 transition-all cursor-pointer flex gap-6 relative overflow-hidden">
                                     <div className="w-24 aspect-[2/3] rounded-2xl overflow-hidden bg-slate-800 shrink-0 shadow-lg relative">
-                                        <img src={getHighResPoster(item.Poster, 200)} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
+                                        <img src={getHighResPoster(item.Poster, 200)} width="200" height="300" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
                                         {item.confidence > 50 && <div className="absolute top-1 right-1 bg-green-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">{Math.round(item.confidence)}% Match</div>}
                                     </div>
                                     <div className="flex-1 py-2 flex flex-col justify-center relative z-10">

@@ -1075,26 +1075,28 @@
             return { ...result, _fromCache: false };
         }
        
-        // --- NEW: Repair Function for Missing Basics ---
+        // --- UPDATED: Repair Function (Fetches Votes & Ratings) ---
         async function repairBasics(item, apiKeys) {
-            // Only run if we have an OMDb key and the item has an ID
             if (!apiKeys.omdb || !item.imdbID) return null;
             
             const isMissing = (val) => !val || val === "N/A" || val === "";
-            
-            // Check if essential fields are missing (Director, Writer, Rating, Plot)
-            if (isMissing(item.Director) || isMissing(item.Writer) || isMissing(item.Plot) || isMissing(item.imdbRating)) {
+            const hasRatings = item.Ratings && item.Ratings.length > 0;
+            const hasVotes = item.imdbVotes && item.imdbVotes !== "N/A";
+
+            // Check if essential fields OR Ratings/Votes are missing
+            if (isMissing(item.Director) || isMissing(item.Plot) || !hasRatings || !hasVotes) {
                 
                 // Fetch fresh OMDb data
                 const data = await safeFetch(`https://www.omdbapi.com/?apikey=${apiKeys.omdb}&i=${item.imdbID}&plot=full`);
                 
                 if (data && data.Response === "True") {
                     return {
-                        // Return standard fields to update at the root level
                         Director: data.Director,
                         Writer: data.Writer,
                         Plot: data.Plot,
-                        imdbRating: data.imdbRating, // Updates the main rating
+                        imdbRating: data.imdbRating,
+                        imdbVotes: data.imdbVotes,  // <--- Added Vote Count
+                        Ratings: data.Ratings,      // <--- Added External Ratings (RT/Metacritic)
                         Rated: data.Rated,
                         Runtime: data.Runtime,
                         Released: data.Released,
@@ -1103,7 +1105,8 @@
                         Language: data.Language,
                         Country: data.Country,
                         Awards: data.Awards,
-                        // Mark as a basic repair so we know how to merge it later
+                        BoxOffice: data.BoxOffice,
+                        Production: data.Production,
                         _basicsRepaired: true 
                     };
                 }
@@ -3484,29 +3487,130 @@
             );
         };
 
+        // --- NEW: Helper to organize episodes with images and plots ---
+        function processSeasonData(item) {
+            // We prioritize TVMaze data as it usually has comprehensive episode lists with images/summaries
+            const rawEpisodes = item.meta?.tvmaze?.episodes || [];
 
-        const DetailModal = ({ item, onClose, onUpdateStatus, onRemove, isAdmin, watchHistory, topActors, onFixMapping }) => {
+            if (!rawEpisodes || rawEpisodes.length === 0) {
+                // Fallback if TVMaze isn't available but generic series data is
+                return item.meta?.series?.seasons || null;
+            }
+
+            const seasonsMap = {};
+
+            rawEpisodes.forEach(ep => {
+                const sNum = ep.season;
+                if (!sNum) return;
+
+                if (!seasonsMap[sNum]) {
+                    // Initialize season entry
+                    seasonsMap[sNum] = { 
+                        season: sNum, 
+                        episodes: [], 
+                        airDate: null,
+                        // Try to find a season poster from TMDB if available
+                        poster: item.tmdb?.seasons?.find(s => s.season_number === sNum)?.poster_path 
+                            ? tmdbImg(item.tmdb.seasons.find(s => s.season_number === sNum).poster_path, "w300")
+                            : null
+                    };
+                }
+
+                // Find earliest airdate for the season container
+                if (ep.airdate && (!seasonsMap[sNum].airDate || ep.airdate < seasonsMap[sNum].airDate)) {
+                    seasonsMap[sNum].airDate = ep.airdate;
+                }
+
+                seasonsMap[sNum].episodes.push({
+                    id: ep.id, // TVMaze ID used for tracking
+                    episode: ep.number,
+                    title: ep.name,
+                    // Strip HTML p tags found in TVMaze summaries
+                    plot: ep.summary?.replace(/<[^>]+>/g, '') || "No episode summary available.",
+                    airDate: ep.airdate,
+                    // Prefer medium image, fall back to original
+                    image: ep.image?.medium || ep.image?.original || null
+                });
+            });
+
+            // Convert map to array and sort by season number
+            return Object.values(seasonsMap).sort((a, b) => a.season - b.season);
+        }
+
+        const DetailModal = ({ item, onClose, onUpdateStatus, onRemove, isAdmin, watchHistory, topActors, onFixMapping, onRefresh, onPlayTrailer, onRate }) => {
             if (!item) return null;
 
             const [activeTab, setActiveTab] = useState('overview');
-            const backdrop = tmdbImg(item.tmdb?.credits?.images?.backdrops?.[0]?.file_path, "original") || getHighResPoster(item.Poster, 1000);
+            const [isRefreshing, setIsRefreshing] = useState(false);
+            const [hoverRating, setHoverRating] = useState(0);
+            const [isHoveringRatingArea, setIsHoveringRatingArea] = useState(false); // New state for area hover
 
-            const weightedRatingData = useMemo(() => {
-                const ratings = extractUserRatings(item);
-                if (ratings.length === 0) return null;
-                return calculateWeightedRating(ratings, { minMinutes: 20, maxMinutesCap: 600 });
+            // --- RATING EMOJI CONFIGURATION ---
+            const RATING_EMOJIS = {
+                1: { e: "🤮", l: "Horrible" },
+                2: { e: "🤢", l: "Terrible" },
+                3: { e: "😩", l: "Bad" },
+                4: { e: "😕", l: "Poor" },
+                5: { e: "😐", l: "Average" },
+                6: { e: "🙂", l: "Okay" },
+                7: { e: "😊", l: "Good" },
+                8: { e: "😃", l: "Great" },
+                9: { e: "🤩", l: "Excellent" },
+                10: { e: "🤯", l: "Fabulous" }
+            };
+
+            // --- Process season data ---
+            const structuredSeasons = useMemo(() => {
+                if (item.Type !== 'series') return null;
+                return processSeasonData(item);
             }, [item]);
 
-            const displayRating = weightedRatingData?.weightedRating ?? item.userMeta?.ratings?.overall ?? item.imdbRating ?? 'N/A';
+            // --- Helpers ---
+            const primaryLanguage = item.Language ? item.Language.split(',')[0] : 'N/A';
+            
+            const seriesStatus = useMemo(() => {
+                if (item.Type !== 'series') return null;
+                if (item.tmdb?.details?.status) return item.tmdb.details.status;
+                if (item.meta?.tvmaze?.status) return item.meta.tvmaze.status;
+                if (item.Year?.endsWith('–')) return "Ongoing";
+                return "Finished";
+            }, [item]);
 
-            const ratingConfidenceLabel = useMemo(() => {
-                if (!weightedRatingData) return null;
-                const minutes = Math.max(...weightedRatingData.breakdown.map(b => b.minutesWatched));
-                const confidence = ratingConfidence(minutes);
-                if (confidence > 0.75) return 'High';
-                if (confidence > 0.4) return 'Medium';
-                return 'Low';
-            }, [weightedRatingData]);
+            const handleRefresh = async (e) => {
+                e.stopPropagation();
+                if (isRefreshing || !onRefresh) return;
+                setIsRefreshing(true);
+                await onRefresh(item);
+                setIsRefreshing(false);
+            };
+
+            // --- RATINGS DATA LOGIC (Brand Colors for Tiles) ---
+            const ratingsData = useMemo(() => {
+                const list = [];
+                // 1. IMDb (Yellow/Black)
+                if (item.imdbID && item.imdbRating && item.imdbRating !== "N/A") {
+                    list.push({ source: "IMDb", value: item.imdbRating, bg: "bg-[#f5c518]", text: "text-black" });
+                }
+                // 2. Rotten Tomatoes (Red/White)
+                const rt = item.Ratings?.find(r => r.Source === "Rotten Tomatoes");
+                if (rt) {
+                    list.push({ source: "RT", value: rt.Value, bg: "bg-[#fa320a]", text: "text-white" });
+                }
+                // 3. Metacritic (Green/White)
+                const mc = item.Ratings?.find(r => r.Source === "Metacritic");
+                if (mc) {
+                    list.push({ source: "Meta", value: mc.Value, bg: "bg-[#00ce7a]", text: "text-white" });
+                }
+                // 4. MyDramaList (Blue/White)
+                if (item.meta?.asian?.mdl) {
+                    list.push({ source: "MDL", value: item.meta.asian.mdl.rating, bg: "bg-[#2e51a2]", text: "text-white" });
+                }
+                // 5. MyAnimeList (Indigo/White)
+                if (item.meta?.anime) {
+                    list.push({ source: "MAL", value: item.meta.anime.score, bg: "bg-[#2e51a2]", text: "text-white" });
+                }
+                return list;
+            }, [item]);
 
             const episodeProgress = useMemo(() => {
                 const episodes = item.meta?.tvmaze?.episodes || item.meta?.series?.episodes || [];
@@ -3528,16 +3632,6 @@
                 return { season: s.season, skipped: s.skipped, watched: s.watched };
             }, [episodeProgress, item, watchHistory]);
 
-            const handleCatchUp = useCallback(() => {
-                const episodes = item.meta?.tvmaze?.episodes || item.meta?.series?.episodes || [];
-                if (!episodes.length || !watchHistory) return;
-                const sortedEpisodes = [...episodes].sort((a, b) => a.season - b.season || a.episode - b.episode);
-                const skippedTarget = sortedEpisodes.find(ep => resolveEpisodeState(ep.id, watchHistory).state === "skipped");
-                if (skippedTarget) { onPlayEpisode?.(item, skippedTarget); return; }
-                const unwatchedTarget = sortedEpisodes.find(ep => resolveEpisodeState(ep.id, watchHistory).state === "unwatched");
-                if (unwatchedTarget) { onPlayEpisode?.(item, unwatchedTarget); }
-            }, [item, watchHistory]);
-
             const scrollToSeason = (seasonNum) => {
                 const el = document.getElementById(`season-${seasonNum}`);
                 if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); el.open = true; }
@@ -3549,40 +3643,79 @@
                     <div className="relative w-full max-w-6xl max-h-full glass rounded-[2rem] overflow-hidden flex flex-col lg:flex-row shadow-2xl border-white/10 animate-reveal">
                         
                         {/* Poster Side */}
-                        <div className="relative w-full lg:w-[400px] h-64 lg:h-auto shrink-0 overflow-hidden">
-                            <img src={getHighResPoster(item.Poster, 800)} alt={item.Title} loading="lazy" width="400" height="600" className="w-full h-full object-cover" />
+                        <div className="relative w-full lg:w-[400px] h-64 lg:h-auto shrink-0 overflow-hidden group cursor-pointer" onClick={() => onPlayTrailer && onPlayTrailer(item)}>
+                            <img src={getHighResPoster(item.Poster, 800)} alt={item.Title} loading="lazy" width="400" height="600" className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" />
                             <div className="absolute inset-0 bg-gradient-to-t from-vault-950 via-transparent lg:bg-gradient-to-r lg:from-transparent lg:to-vault-950"></div>
-                            <button onClick={onClose} className="lg:hidden absolute top-4 right-4 bg-black/50 p-2 rounded-full text-white"><Icon name="close" /></button>
+                            
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                                <div className="bg-white/20 backdrop-blur-md p-4 rounded-full border border-white/30 shadow-2xl transform scale-75 group-hover:scale-100 transition-transform duration-300">
+                                    <Icon name="play" size={32} className="text-white fill-white ml-1" />
+                                </div>
+                                <div className="absolute bottom-8 text-white font-bold text-sm tracking-widest uppercase opacity-0 group-hover:opacity-100 transform translate-y-4 group-hover:translate-y-0 transition-all duration-300">
+                                    Watch Trailer
+                                </div>
+                            </div>
+                            <button onClick={(e) => { e.stopPropagation(); onClose(); }} className="lg:hidden absolute top-4 right-4 bg-black/50 p-2 rounded-full text-white"><Icon name="close" /></button>
                         </div>
 
                         {/* Content Side */}
                         <div className="flex-1 flex flex-col overflow-hidden bg-vault-950">
+                            
+                            {/* --- HEADER SECTION --- */}
                             <div className="p-8 pb-4 flex justify-between items-start">
-                                <div>
+                                <div className="flex-1 min-w-0">
                                     <div className="flex flex-wrap items-center gap-3 mb-2">
                                         <Badge color="gold">{item.Rated}</Badge>
                                         <Badge color="slate">{formatRuntime(item.Runtime)}</Badge>
                                         <span className="text-slate-400 text-sm font-medium">{item.Year}</span>
-                                        {isAdmin && item._registry_source === 'cache' && <Badge color="slate">Registry: Cached</Badge>}
+                                        
+                                        {/* Primary Language */}
+                                        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/5 border border-white/5">
+                                            <Icon name="globe" size={12} className="text-slate-400" />
+                                            <span className="text-xs font-bold text-slate-300">{primaryLanguage}</span>
+                                        </div>
+
+                                        {/* Series Status */}
+                                        {seriesStatus && (
+                                            <Badge color={seriesStatus === 'Ended' || seriesStatus === 'Finished' || seriesStatus === 'Canceled' ? 'red' : 'green'}>
+                                                {seriesStatus}
+                                            </Badge>
+                                        )}
+
                                         {isAdmin && item._registry_source === 'api' && <Badge color="green">Registry: Fresh</Badge>}
                                     </div>
-                                    <h1 className="text-3xl lg:text-5xl font-black text-white leading-tight">{item.Title}</h1>
-                                    <div className="flex items-center gap-4 mt-2">
-                                        <div className="text-2xl font-black text-white">{displayRating}</div>
-                                        {weightedRatingData && (
-                                            <div className="text-xs text-slate-400">Based on {weightedRatingData.contributingItems} viewing session{weightedRatingData.contributingItems > 1 ? 's' : ''}</div>
-                                        )}
-                                    </div>
+                                    
+                                    <h1 className="text-3xl lg:text-5xl font-black text-white leading-tight mb-3">{item.Title}</h1>
+                                    
+                                    {/* UPDATED: Solid Color Rating Tiles */}
+                                    {ratingsData.length > 0 && (
+                                        <div className="flex flex-wrap gap-3 mb-4">
+                                            {ratingsData.map((r, i) => (
+                                                <div key={i} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${r.bg} shadow-lg shadow-black/20`}>
+                                                    <span className={`text-[10px] font-black uppercase tracking-wider opacity-80 ${r.text}`}>{r.source}</span>
+                                                    <span className={`text-sm font-black ${r.text}`}>{r.value}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+
                                     {topActors && topActors.some(a => item.meta?.cast?.some(c => normalizeActor(c.name) === a)) && (
-                                        <div className="mt-3"><Badge color="gold">Features one of your favorite actors</Badge></div>
+                                        <div className="mt-2"><Badge color="gold">Features one of your favorite actors</Badge></div>
                                     )}
                                     <p className="text-indigo-400 font-bold mt-2 text-sm uppercase tracking-widest">{item.Genre}</p>
-                                    {item.meta?.asian?.mdl && (
-                                        <a href={item.meta.asian.mdl.url} target="_blank" rel="noreferrer" className="mt-2 text-xs text-emerald-400 flex items-center gap-1 font-bold hover:underline">View on MyDramaList <Icon name="external" size={12} /></a>
-                                    )}
                                 </div>
-                                <div className="flex flex-col items-end gap-2">
-                                    <button onClick={onClose} className="hidden lg:flex bg-white/5 hover:bg-white/10 p-3 rounded-full text-white transition-all"><Icon name="close" /></button>
+
+                                <div className="flex flex-col items-end gap-2 ml-4">
+                                    <div className="flex gap-2">
+                                        <button 
+                                            onClick={handleRefresh} 
+                                            className={`hidden lg:flex bg-white/5 hover:bg-white/10 p-3 rounded-full text-white transition-all ${isRefreshing ? 'animate-spin text-indigo-400' : ''}`}
+                                            title="Force Refresh Metadata"
+                                        >
+                                            <Icon name="refresh" />
+                                        </button>
+                                        <button onClick={onClose} className="hidden lg:flex bg-white/5 hover:bg-white/10 p-3 rounded-full text-white transition-all"><Icon name="close" /></button>
+                                    </div>
                                     {isAdmin && (
                                         <button onClick={() => onFixMapping?.(item)}
                                             className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-xs text-indigo-300 font-bold transition-all">Fix External Mapping</button>
@@ -3612,66 +3745,81 @@
                             <div className="flex-1 p-8 overflow-y-auto custom-scrollbar">
                                 {activeTab === 'overview' && (
                                     <div className="space-y-8 animate-reveal">
+                                        
+                                        {/* AWARDS BANNER */}
                                         {item.Awards && item.Awards !== "N/A" && (
                                             <div className="relative p-6 rounded-2xl bg-gradient-to-r from-amber-500/10 to-transparent border border-amber-500/20 flex items-start gap-4">
-                                                <div className="p-3 bg-amber-500/20 rounded-full text-amber-400">
-                                                    <Icon name="star" size={24} />
-                                                </div>
+                                                <div className="p-3 bg-amber-500/20 rounded-full text-amber-400"><Icon name="star" size={24} /></div>
                                                 <div>
                                                     <h4 className="text-amber-400 font-black uppercase tracking-widest text-xs mb-1">Awards & Accolades</h4>
                                                     <p className="text-white font-bold text-lg leading-snug">{item.Awards}</p>
                                                 </div>
                                             </div>
                                         )}
-                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                            <div className="md:col-span-2 space-y-6">
-                                                <div>
-                                                    <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-3">Synopsis</h3>
-                                                    <p className="text-slate-300 text-lg leading-relaxed">{item.Plot}</p>
-                                                </div>
-                                                <div className="grid grid-cols-2 gap-4">
-                                                    <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Director</p><p className="text-white font-bold">{item.Director}</p></div>
-                                                    <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Writer</p><p className="text-white font-bold">{item.Writer}</p></div>
-                                                </div>
-                                            </div>
-                                            <div className="space-y-4">
-                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-3">Ratings</h3>
-                                                <div className="space-y-2">
-                                                    {Object.entries(item.meta?.ratingsExternal || {}).map(([key, val]) => val && (
-                                                        <div key={key} className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
-                                                            <span className="text-xs font-bold text-slate-400 uppercase">{key}</span>
-                                                            <span className="text-sm font-black text-white">{typeof val === 'object' ? val.rating : val}</span>
-                                                        </div>
-                                                    ))}
-                                                    {item.meta?.asian?.mdl && (
-                                                        <div className="flex items-center justify-between p-3 rounded-xl bg-teal-500/10 border border-teal-500/20">
-                                                            <span className="text-xs font-bold text-teal-400 uppercase">MyDramaList</span>
-                                                            <span className="text-sm font-black text-teal-400">{item.meta.asian.mdl.rating}</span>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                                {weightedRatingData && (
-                                                    <div className="mt-4 p-4 bg-white/5 rounded-xl border border-white/5">
-                                                        <h4 className="text-xs font-bold text-slate-400 uppercase mb-3">Session Breakdown</h4>
-                                                        <div className="flex items-baseline gap-2 mb-4">
-                                                            <span className="text-4xl font-black text-gradient">{weightedRatingData.weightedRating}</span>
-                                                            <span className="text-slate-400 text-sm">Weighted Score</span>
-                                                            {ratingConfidenceLabel && (
-                                                                <div className="ml-auto"><Badge color={ratingConfidenceLabel === "High" ? "green" : ratingConfidenceLabel === "Medium" ? "gold" : "red"}>{ratingConfidenceLabel} Confidence</Badge></div>
-                                                            )}
-                                                        </div>
-                                                        <ul className="space-y-2 text-xs text-slate-300">
-                                                            {weightedRatingData.breakdown.map((b, idx) => (
-                                                                <li key={idx} className="flex justify-between items-center p-2 rounded bg-white/5">
-                                                                    <span className="flex items-center gap-1"><Icon name="star" size={10} className="text-amber-400" /> {b.rating}</span>
-                                                                    <span>{b.minutesWatched} min</span>
-                                                                    <span className="text-slate-500">×{b.confidence}</span>
-                                                                </li>
-                                                            ))}
-                                                        </ul>
+
+                                        {/* UPDATED: YOUR RATING AREA (Hover Reveal) */}
+                                        <div 
+                                            className="glass p-6 rounded-2xl border border-white/10 transition-all duration-300 hover:border-indigo-500/30 hover:bg-white/5"
+                                            onMouseEnter={() => setIsHoveringRatingArea(true)}
+                                            onMouseLeave={() => setIsHoveringRatingArea(false)}
+                                        >
+                                            <div className="flex justify-between items-start mb-4">
+                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400">Your Rating</h3>
+                                                {/* Text always visible if rated, or if hovering */}
+                                                {(hoverRating > 0 || item.userMeta?.rating) && (
+                                                    <div className="text-right">
+                                                        <p className="text-xl font-black text-white leading-none">
+                                                            {hoverRating > 0 ? RATING_EMOJIS[hoverRating].l : RATING_EMOJIS[item.userMeta.rating].l}
+                                                        </p>
+                                                        <p className="text-xs font-bold text-slate-500 mt-1">
+                                                            {hoverRating || item.userMeta.rating}/10
+                                                        </p>
                                                     </div>
                                                 )}
                                             </div>
+                                            
+                                            {/* LOGIC: Show Single Big Emoji if Rated & Not Hovering. Else Show All. */}
+                                            {item.userMeta?.rating && !isHoveringRatingArea ? (
+                                                <div className="flex justify-center py-2 animate-reveal">
+                                                    <span className="text-6xl filter drop-shadow-[0_0_15px_rgba(99,102,241,0.5)] transform scale-110">
+                                                        {RATING_EMOJIS[item.userMeta.rating].e}
+                                                    </span>
+                                                </div>
+                                            ) : (
+                                                <div className="flex flex-wrap justify-between gap-1 animate-reveal">
+                                                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(star => (
+                                                        <button 
+                                                            key={star}
+                                                            onMouseEnter={() => setHoverRating(star)}
+                                                            onMouseLeave={() => setHoverRating(0)}
+                                                            onClick={() => onRate && onRate(item, star)}
+                                                            className={`
+                                                                text-3xl transition-all duration-200 hover:scale-125 focus:outline-none p-1
+                                                                ${(hoverRating || item.userMeta?.rating || 0) >= star ? 'opacity-100 grayscale-0' : 'opacity-30 grayscale'}
+                                                            `}
+                                                            title={`${star} - ${RATING_EMOJIS[star].l}`}
+                                                        >
+                                                            {RATING_EMOJIS[star].e}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            
+                                            {!item.userMeta?.rating && (
+                                                <p className="mt-3 text-xs text-slate-500 text-center">Rate to automatically mark as watched.</p>
+                                            )}
+                                        </div>
+
+                                        {/* SYNOPSIS */}
+                                        <div>
+                                            <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-3">Synopsis</h3>
+                                            <p className="text-slate-300 text-lg leading-relaxed">{item.Plot}</p>
+                                        </div>
+
+                                        {/* CREW GRID */}
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Director</p><p className="text-white font-bold">{item.Director}</p></div>
+                                            <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Writer</p><p className="text-white font-bold line-clamp-1">{item.Writer}</p></div>
                                         </div>
                                     </div>
                                 )}
@@ -3679,6 +3827,8 @@
                                 {activeTab === 'details' && (
                                     <div className="grid grid-cols-2 md:grid-cols-4 gap-6 animate-reveal">
                                         {[
+                                            { label: 'Director', value: item.Director },
+                                            { label: 'Writer', value: item.Writer },
                                             { label: 'Language', value: item.Language },
                                             { label: 'Country', value: item.Country },
                                             { label: 'Released', value: item.Released },
@@ -3695,7 +3845,7 @@
 
                                 {activeTab === 'cast' && (
                                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-6 animate-reveal">
-                                        {item.meta?.cast?.filter(person => person.photo).map(person => (
+                                        {item.meta?.cast?.filter(person => person.photo && !person.photo.includes("ui-avatars.com")).map(person => (
                                             <div key={person.name} className="flex flex-col items-center text-center gap-3 group">
                                                 <div className="w-24 h-24 rounded-full overflow-hidden ring-2 ring-white/10 group-hover:ring-indigo-500/50 transition-all duration-300">
                                                     <img src={person.photo} alt={person.name} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
@@ -3709,40 +3859,47 @@
                                     </div>
                                 )}
 
-                                {activeTab === 'seasons' && item.meta?.series?.seasons && (
+                                {activeTab === 'seasons' && structuredSeasons && (
                                     <div className="space-y-4 animate-reveal">
                                         <SeasonHeatmap seasons={seasonProgress} onSeasonClick={(season) => { scrollToSeason(season); }} />
-                                        {item.meta.series.seasons.map(season => (
+                                        {structuredSeasons.length === 0 ? <EmptyState message="No episode information available yet." /> : structuredSeasons.map(season => (
                                             <details key={season.season} id={`season-${season.season}`} className="group glass rounded-2xl overflow-hidden transition-all duration-300">
-                                                <summary className="flex items-center justify-between p-6 cursor-pointer hover:bg-white/5 list-none">
-                                                    <div className="flex items-center gap-4">
-                                                        <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center font-black text-white">S{season.season}</div>
+                                                <summary className="flex items-center justify-between p-6 cursor-pointer hover:bg-white/5 list-none relative overflow-hidden">
+                                                    {season.poster && (<div className="absolute inset-0 opacity-20 pointer-events-none"><img src={season.poster} className="w-full h-full object-cover blur-sm" /><div className="absolute inset-0 bg-vault-950/50"></div></div>)}
+                                                    <div className="flex items-center gap-4 relative z-10">
+                                                        <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center font-black text-white text-xl">S{season.season}</div>
                                                         <div>
-                                                            <h4 className="text-white font-bold">Season {season.season}</h4>
-                                                            <p className="text-slate-500 text-xs font-medium">{season.episodes?.length || 0} Episodes • {season.airDate}</p>
+                                                            <h4 className="text-white font-bold text-lg">Season {season.season}</h4>
+                                                            <p className="text-slate-400 text-xs font-medium">{season.episodes?.length || 0} Episodes {season.airDate ? `• Started ${season.airDate.slice(0,4)}` : ''}</p>
                                                         </div>
                                                     </div>
-                                                    <Icon name="play" size={16} className="text-slate-400 group-open:rotate-90 transition-transform" />
+                                                    <div className="relative z-10 bg-white/10 p-2 rounded-full group-hover:bg-white/20 transition-colors"><Icon name="play" size={16} className="text-slate-300 group-open:rotate-90 transition-transform" /></div>
                                                 </summary>
-                                                <div className="px-6 pb-6 pt-2 divide-y divide-white/5">
-                                                    {season.episodes?.map(ep => (
-                                                        <div key={ep.episode} className="py-4 flex items-center justify-between group/ep">
-                                                            <div className="flex gap-4">
-                                                                <span className="text-indigo-400 font-mono text-sm">E{ep.episode}</span>
-                                                                <div>
-                                                                    <p className="text-white text-sm font-bold group-hover/ep:text-indigo-400 transition-colors">{ep.title}</p>
-                                                                    <p className="text-slate-500 text-[10px] font-medium mt-0.5">{ep.airDate}</p>
-                                                                </div>
+                                                <div className="px-6 pb-6 pt-2 divide-y divide-white/5 bg-vault-950/30">
+                                                    {season.episodes?.map(ep => {
+                                                         const isWatched = watchHistory?.[ep.id]?.watched;
+                                                         return (
+                                                        <div key={ep.episode} className="py-6 flex flex-col md:flex-row gap-6 group/ep relative">
+                                                            <div className="w-full md:w-48 aspect-video bg-slate-800 rounded-xl overflow-hidden shrink-0 relative shadow-lg shadow-black/20">
+                                                                {ep.image ? <img src={ep.image} alt={ep.title} className="w-full h-full object-cover group-hover/ep:scale-105 transition-transform duration-500" loading="lazy" /> : <div className="absolute inset-0 flex items-center justify-center text-slate-600"><Icon name="image" size={24} /></div>}
+                                                                {isWatched && <div className="absolute top-2 right-2"><Badge color="green">Watched</Badge></div>}
                                                             </div>
-                                                            {ep.watched && <Badge color="green">Watched</Badge>}
+                                                            <div className="flex-1 min-w-0 py-1">
+                                                                <div className="flex justify-between items-start mb-2">
+                                                                    <div><span className="text-indigo-400 font-mono text-sm font-bold mr-3">E{ep.episode}</span><span className="text-white font-bold text-lg group-hover/ep:text-indigo-400 transition-colors leading-tight">{ep.title}</span></div>
+                                                                    <p className="text-slate-500 text-xs font-medium whitespace-nowrap ml-4">{ep.airDate || 'TBA'}</p>
+                                                                </div>
+                                                                <p className="text-slate-300 text-sm leading-relaxed line-clamp-3 md:line-clamp-2">{ep.plot}</p>
+                                                            </div>
                                                         </div>
-                                                    ))}
+                                                    )})}
                                                 </div>
                                             </details>
                                         ))}
                                     </div>
                                 )}
                             </div>
+                            
                             <div className="p-8 pt-4 border-t border-white/5 flex gap-4 bg-vault-950/80 backdrop-blur-md">
                                 <button onClick={() => onUpdateStatus('watched')} className={`flex-1 py-4 rounded-2xl font-black text-sm uppercase tracking-[0.2em] transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] flex items-center justify-center gap-2 ${item.userMeta?.status === 'watched' ? 'bg-emerald-600 text-white shadow-[0_0_30px_rgba(16,185,129,0.4)]' : 'bg-white/5 text-slate-400 hover:text-white border border-white/5 hover:bg-white/10'}`}><Icon name="check" size={18} />Watched</button>
                                 <button onClick={() => onUpdateStatus('watchlist')} className={`flex-1 py-4 rounded-2xl font-black text-sm uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 ${item.userMeta?.status === 'watchlist' ? 'bg-indigo-600 text-white' : 'bg-white/5 text-slate-400 hover:text-white border border-white/5'}`}><Icon name="clock" size={18} />Watchlist</button>
@@ -4506,13 +4663,14 @@
             };
 
             const enrich = async (item) => {
-                // --- FIX: Check for "N/A" or missing data before skipping ---
+                // --- FIX: Check for Missing Votes/Ratings too ---
                 const hasMissingData = 
                     !item.Director || item.Director === "N/A" || 
-                    !item.Writer || item.Writer === "N/A" || 
-                    !item.Plot || item.Plot === "N/A";
+                    !item.Plot || item.Plot === "N/A" ||
+                    !item.imdbVotes || item.imdbVotes === "N/A" ||
+                    !item.Ratings || item.Ratings.length === 0;
 
-                // Only skip if the item is enriched AND has no missing data
+                // Only skip if fully enriched AND has no missing data
                 if (!hasMissingData && item.enriched && item.enrichmentSources?.length > 0) {
                     return item;
                 }
@@ -4565,7 +4723,32 @@
                     await supabase.from('vault_items').delete().eq('user_id', session.user.id).eq('imdb_id', imdbID);
                 }
             };
+            // --- NEW: Handle User Rating ---
+            const handleRate = async (item, rating) => {
+                const updatedUserMeta = {
+                    ...item.userMeta,
+                    rating: rating,
+                    status: 'watched', // AUTO-WATCH logic
+                    lastUpdated: Date.now()
+                };
+                
+                // Create updated item object
+                const updatedItem = { ...item, userMeta: updatedUserMeta };
 
+                // 1. Update Local State
+                updateVaultItem(item.imdbID, updatedItem);
+                setSelectedItem(updatedItem); // Update modal immediately
+
+                // 2. Persist to Database
+                if (session) {
+                    await supabase.from('vault_items').upsert({
+                        user_id: session.user.id,
+                        imdb_id: item.imdbID,
+                        user_meta: updatedItem, // Save full object structure
+                        updated_at: new Date()
+                    });
+                }
+            };
             const refreshLibrary = async () => {
                 if (isRefreshing) return;
                 setIsRefreshing(true);
@@ -4772,7 +4955,19 @@
                         )}
                     </main>
 
-                    <DetailModal item={selectedItem} onClose={() => setSelectedItem(null)} onUpdateStatus={toggleStatus} onRemove={removeFromVault} isAdmin={isAdmin} watchHistory={vault.watched} topActors={topActors} />
+                    <DetailModal 
+                    item={selectedItem} 
+                    onClose={() => setSelectedItem(null)} 
+                    onUpdateStatus={toggleStatus} 
+                    onRemove={removeFromVault} 
+                    isAdmin={isAdmin} 
+                    watchHistory={vault.watched} 
+                    topActors={topActors}
+                    onFixMapping={(i) => console.log("Mapping logic here", i)}
+                    onRefresh={enrich}
+                    onPlayTrailer={handlePlayTrailer}
+                    onRate={handleRate}  // <--- ADD THIS LINE
+                />
                     <SearchOverlay
                         isOpen={isSearchOpen}
                         onClose={() => setIsSearchOpen(false)}

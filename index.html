@@ -1038,39 +1038,144 @@
         async function enrichTMDB(item, ctx, apiKeys) {
             if (!apiKeys.tmdb) return null;
             let tmdbId = item.tmdb?.id;
-            let tmdbData = null;
-            const cacheKey = `tmdb_enrich_${item.imdbID}`;
+            
+            // Force a fresh fetch by using a new cache key version
+            const cacheKey = `tmdb_enrich_v3_${item.imdbID}`;
             const cached = cacheGet(cacheKey);
             if (cached) return { ...cached, _fromCache: true };
 
+            // 1. Resolve TMDB ID if missing
             if (!tmdbId) {
                 const find = await safeFetch(`https://api.themoviedb.org/3/find/${item.imdbID}?api_key=${apiKeys.tmdb}&external_source=imdb_id`);
                 if (find && !find.error) {
-                    tmdbData = ctx.isSeries ? find?.tv_results?.[0] : find?.movie_results?.[0];
-                    if (tmdbData) tmdbId = tmdbData.id;
+                    // TMDB returns arrays; pick the first match
+                    const result = ctx.isSeries ? find?.tv_results?.[0] : find?.movie_results?.[0];
+                    if (result) tmdbId = result.id;
                 }
             }
+            
             if (!tmdbId) return null;
 
-            // FIX: Fetch details for BOTH Movies and Series (to get Revenue/Production)
-            const [credits, details, images] = await Promise.all([
-                safeFetch(`https://api.themoviedb.org/3/${ctx.isSeries ? 'tv' : 'movie'}/${tmdbId}/credits?api_key=${apiKeys.tmdb}`),
-                safeFetch(`https://api.themoviedb.org/3/${ctx.isSeries ? 'tv' : 'movie'}/${tmdbId}?api_key=${apiKeys.tmdb}`), 
-                safeFetch(`https://api.themoviedb.org/3/${ctx.isSeries ? 'tv' : 'movie'}/${tmdbId}/images?api_key=${apiKeys.tmdb}`)
-            ]);
+            // 2. The "Mega-Fetch" Configuration
+            const type = ctx.isSeries ? 'tv' : 'movie';
+            
+            // Append all extra modules we want in one HTTP call
+            const append = [
+                'credits',
+                'external_ids',
+                'images',
+                'videos',
+                'keywords',
+                'release_dates',
+                'content_ratings',
+                'recommendations',
+                'similar',
+                'watch/providers'
+            ].join(',');
 
+            // 3. Execute Fetch
+            // We request 'include_image_language=en,null' to get English text logos and textless backdrops
+            const mainData = await safeFetch(
+                `https://api.themoviedb.org/3/${type}/${tmdbId}?api_key=${apiKeys.tmdb}&append_to_response=${append}&include_image_language=en,null`
+            );
+
+            if (!mainData || mainData.error) return null;
+
+            // 4. Data Processing & Normalization
+
+            // A. Extract Certification (Priority: US)
+            let certification = null;
+            if (ctx.isSeries) {
+                const rating = mainData.content_ratings?.results?.find(r => r.iso_3166_1 === "US");
+                certification = rating ? rating.rating : null;
+            } else {
+                const release = mainData.release_dates?.results?.find(r => r.iso_3166_1 === "US");
+                // Look for theatrical release (type 3) or digital (4), otherwise take first valid
+                const cert = release?.release_dates?.find(d => d.certification) || release?.release_dates?.[0];
+                certification = cert ? cert.certification : null;
+            }
+
+            // B. Extract Best Logo (ClearArt)
+            // Prefer PNGs, sorted by vote average (popularity) implicitly by API
+            const logos = mainData.images?.logos?.filter(l => l.iso_639_1 === 'en' || l.iso_639_1 === null) || [];
+            const logo = logos.length > 0 ? logos[0].file_path : null;
+
+            // C. Organize Videos
+            const allVideos = mainData.videos?.results?.filter(v => v.site === "YouTube") || [];
+            const trailers = allVideos.filter(v => v.type === "Trailer");
+            const featurettes = allVideos.filter(v => v.type === "Featurette" || v.type === "Behind the Scenes" || v.type === "Teaser");
+
+            // D. Production & Network Logos
+            // Ensure full paths for logos
+            const production = (mainData.production_companies || []).map(c => ({
+                ...c,
+                logo_path: c.logo_path // raw path, UI will handle resizing
+            }));
+            const networks = (mainData.networks || []).map(n => ({
+                ...n,
+                logo_path: n.logo_path
+            }));
+
+            // 5. Construct Final Data Object
             const result = {
                 tmdb: {
                     id: tmdbId,
-                    cast: credits && !credits.error ? (credits.cast || []) : [],
-                    director: credits && !credits.error ? (credits.crew?.filter(c => c.job === 'Director').map(d => d.name) || []) : [],
-                    // Store raw details to backfill BoxOffice/Production later
-                    details: details && !details.error ? details : null, 
-                    seasons: ctx.isSeries && details && !details.error ? details.seasons : null,
-                    credits: { images: { backdrops: images && !images.error ? (images.backdrops || []) : [] } },
+                    
+                    // Core Metadata
+                    tagline: mainData.tagline,
+                    status: mainData.status, // "Returning Series", "Released", etc.
+                    budget: mainData.budget,
+                    revenue: mainData.revenue,
+                    original_title: mainData.original_title || mainData.original_name,
+                    original_language: mainData.original_language,
+                    spoken_languages: mainData.spoken_languages?.map(l => l.english_name),
+                    runtime: mainData.runtime || (mainData.episode_run_time?.length ? mainData.episode_run_time[0] : null),
+                    
+                    // Visuals
+                    logo: logo,
+                    backdrops: mainData.images?.backdrops || [],
+                    posters: mainData.images?.posters || [],
+                    
+                    // Lists & Collections
+                    keywords: mainData.keywords?.keywords || mainData.keywords?.results || [],
+                    production_companies: production,
+                    networks: networks,
+                    collection: mainData.belongs_to_collection, // { id, name, poster_path, backdrop_path }
+                    
+                    // Media
+                    videos: {
+                        trailers: trailers,
+                        featurettes: featurettes,
+                        all: allVideos
+                    },
+
+                    // External Data
+                    social: mainData.external_ids || {},
+                    homepage: mainData.homepage,
+                    certification: certification,
+                    recommendations: mainData.recommendations?.results || [],
+                    similar: mainData.similar?.results || [],
+                    
+                    // Standard Pass-throughs
+                    cast: mainData.credits?.cast || [],
+                    crew: mainData.credits?.crew || [],
+                    seasons: mainData.seasons || [],
+                    
+                    // Backup Raw Data (useful for specific niche fields)
+                    details: {
+                        overview: mainData.overview,
+                        vote_average: mainData.vote_average,
+                        vote_count: mainData.vote_count,
+                        popularity: mainData.popularity,
+                        first_air_date: mainData.first_air_date,
+                        last_air_date: mainData.last_air_date
+                    },
+                    
                     confidence: 0.95
                 }
             };
+
+            // Save to cache and return
             cacheSet(cacheKey, result);
             return { ...result, _fromCache: false };
         }
@@ -1119,14 +1224,12 @@
             const ctx = classifyForEnrichment(item);
             const meta = { ...(item.meta || {}) };
             let tmdbData = { ...(item.tmdb || {}) };
-            let rootUpdates = {}; // Store updates for top-level fields (Director, etc.)
+            let rootUpdates = {}; // Store updates for top-level fields
             const provenance = [];
             let isInstant = false;
 
             const stages = [
-                // 1. First Priority: Repair missing basics (Director, Ratings, etc.)
                 () => repairBasics(item, apiKeys),
-                // 2. Then fetch extras
                 () => enrichAnime(item, ctx, supabase, isAdmin),
                 () => enrichTVMaze(item, ctx),
                 () => resolveMDL(item, ctx, supabase, apiKeys, isAdmin),
@@ -1135,11 +1238,11 @@
 
             const results = await Promise.allSettled(stages.map(s => s()));
 
-            // ... inside enrichItem ...
             results.forEach(res => {
                 if (res.status === 'fulfilled' && res.value) {
                     const result = res.value;
 
+                    // 1. Handle OMDb Basic Repairs
                     if (result._basicsRepaired) {
                         delete result._basicsRepaired;
                         Object.assign(rootUpdates, result);
@@ -1147,47 +1250,51 @@
                     } else {
                         if (result._fromCache) isInstant = true;
                         
-                        // --- NEW: Map TMDB Details to Root Fields if missing ---
-                        if (result.tmdb && result.tmdb.details) {
-                            const d = result.tmdb.details;
+                        // 2. Map new TMDB Mega-Fetch Data to Root Fields
+                        if (result.tmdb) {
+                            const t = result.tmdb;
                             
-                            // Backfill Box Office
-                            if ((!item.BoxOffice || item.BoxOffice === 'N/A') && d.revenue > 0) {
-                                rootUpdates.BoxOffice = formatCurrency(d.revenue);
+                            // Map Official Certification (e.g. PG-13, TV-MA)
+                            if (t.certification) {
+                                rootUpdates.Rated = t.certification;
                             }
                             
-                            // Backfill Production
-                            if ((!item.Production || item.Production === 'N/A') && d.production_companies?.length > 0) {
-                                rootUpdates.Production = d.production_companies.map(c => c.name).join(', ');
+                            // Backfill Financials and Production if OMDb missed them
+                            if ((!item.BoxOffice || item.BoxOffice === 'N/A') && t.revenue > 0) {
+                                rootUpdates.BoxOffice = formatCurrency(t.revenue);
+                            }
+                            if ((!item.Production || item.Production === 'N/A') && t.production_companies?.length > 0) {
+                                rootUpdates.Production = t.production_companies.map(c => c.name).join(', ');
+                            }
+                            if ((!item.Runtime || item.Runtime === 'N/A') && t.runtime > 0) {
+                                rootUpdates.Runtime = `${t.runtime} min`;
                             }
                             
-                            // Backfill Runtime if missing
-                            if ((!item.Runtime || item.Runtime === 'N/A') && d.runtime > 0) {
-                                rootUpdates.Runtime = `${d.runtime} min`;
-                            }
-
-                            // Merge the rest of TMDB data
-                            tmdbData = { ...tmdbData, ...result.tmdb };
-                            delete result.tmdb; // Don't double merge
+                            // Merge the rest of the rich TMDB data
+                            tmdbData = { ...tmdbData, ...t };
+                            delete result.tmdb;
                         }
                         
-                        if (result.tmdb) { 
-                            tmdbData = { ...tmdbData, ...result.tmdb }; 
-                            delete result.tmdb; 
-                        }
-                        
+                        // Merge Asian/Anime meta data
                         Object.assign(meta, result);
                         provenance.push(...Object.keys(result));
                     }
-                } 
-                // ... error handling ...
+                } else if (res.status === 'rejected') {
+                    console.warn("Enrichment stage failed", res.reason);
+                }
             });
 
-            // If we found TMDB Cast, merge it intelligently
+            // 3. Cast Merging & Deduplication
             if (tmdbData.cast) {
-                const newCast = tmdbData.cast.map(c => ({ name: c.name, character: c.character, photo: c.profile_path ? `https://image.tmdb.org/t/p/w185${c.profile_path}` : null }));
+                const newCast = tmdbData.cast.map(c => ({ 
+                    name: c.name, 
+                    character: c.character, 
+                    photo: c.profile_path ? `https://image.tmdb.org/t/p/w185${c.profile_path}` : null 
+                }));
+                
                 const combined = [...(meta.cast || []), ...newCast];
                 const seen = new Set();
+                
                 meta.cast = combined.filter(a => {
                     const k = normalizeActor(a.name);
                     if (seen.has(k)) return false;
@@ -1196,12 +1303,12 @@
                 });
             }
 
-            // Return the item with Root updates merged at the top level, and Meta updates in .meta
+            // 4. Return Final Merged Object
             return { 
                 ...item, 
-                ...rootUpdates, // Apply Director, Writer, Ratings fixes here
+                ...rootUpdates, // Applies Rated, BoxOffice, Production, Runtime
                 meta, 
-                tmdb: tmdbData, 
+                tmdb: tmdbData, // Contains Logos, Videos, Collections, etc.
                 enrichmentSources: provenance, 
                 enriched: true, 
                 _fromCache: isInstant 
@@ -1211,9 +1318,14 @@
         // --- SEARCH API WRAPPERS & NORMALIZATION ---
         async function searchTMDB(query, year, type = 'movie', apiKey) {
             if (!apiKey) return null;
-            const endpoint = type === 'series' ? 'search/tv' : 'search/movie';
+            let endpoint = 'search/movie';
+            if (type === 'series') endpoint = 'search/tv';
+            if (type === 'person') endpoint = 'search/person'; 
+
             let url = `https://api.themoviedb.org/3/${endpoint}?api_key=${apiKey}&query=${encodeURIComponent(query)}`;
-            if (year) { url += type === 'series' ? `&first_air_date_year=${year}` : `&year=${year}`; }
+            if (year && type !== 'person') { 
+                url += type === 'series' ? `&first_air_date_year=${year}` : `&year=${year}`; 
+            }
             return safeFetch(url);
         }
 
@@ -1239,23 +1351,53 @@
             return safeFetch(`https://${RAPID_HOST_MDL}/search/title?q=${encodeURIComponent(query)}`, { headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': RAPID_HOST_MDL } });
         }
 
-        function normalizeCandidate(raw, source) {
-            let type = 'movie';
-            if (source === 'tvmaze' || source === 'jikan' || source === 'mdl') type = 'series';
-            if (source === 'omdb' && raw.Type === 'series') type = 'series';
-            if (source === 'tmdb' && (raw.media_type === 'tv' || raw.first_air_date)) type = 'series';
+        function normalizeCandidate(raw, source, forcedType = null) {
+            let type = forcedType || 'movie'; // Use forced type if provided, else default to movie
+
+            // Fallback detection if no forced type (e.g. from 'all' search)
+            if (!forcedType) {
+                if (source === 'tmdb' && raw.media_type === 'person') type = 'person';
+                else if (source === 'tmdb' && (raw.media_type === 'tv' || raw.first_air_date)) type = 'series';
+                else if (source === 'tvmaze' || source === 'jikan' || source === 'mdl') type = 'series';
+                else if (source === 'omdb' && raw.Type === 'series') type = 'series';
+            }
+
+            // Extract image
+            let poster = null;
+            if (type === 'person') {
+                poster = raw.profile_path ? `https://image.tmdb.org/t/p/w500${raw.profile_path}` : null;
+            } else {
+                poster = raw.image?.original || (raw.poster_path ? `https://image.tmdb.org/t/p/w500${raw.poster_path}` : raw.Poster) || null;
+            }
+
+            // Extract Title
+            const title = raw.name || raw.title || raw.Title;
+
+            // Extract Year / Subtext
+            let year = null;
+            if (type === 'person') {
+                const known = raw.known_for?.map(k => k.title || k.name).join(', ');
+                year = known ? `Known for: ${known}` : 'Person';
+            } else {
+                year = raw.premiered?.slice(0, 4) || raw.release_date?.slice(0, 4) || raw.first_air_date?.slice(0, 4) || raw.Year || null;
+            }
+
+            // Extract Votes for Sorting
+            let votes = 0;
+            if (raw.vote_count) votes = raw.vote_count;
+            else if (raw.imdbVotes) votes = parseInt(raw.imdbVotes.replace(/,/g, ''), 10) || 0;
 
             return {
                 source,
-                title: raw.title || raw.name || raw.Title,
-                year: raw.premiered?.slice(0, 4) || raw.release_date?.slice(0, 4) || raw.first_air_date?.slice(0, 4) || raw.Year || null,
-                imdbID: raw.external_ids?.imdb_id || raw.externals?.imdb || raw.imdbID || null, // Updated to look for injected ID
+                title: title,
+                year: year,
+                imdbID: raw.external_ids?.imdb_id || raw.externals?.imdb || raw.imdbID || null,
                 tmdbID: source === 'tmdb' ? raw.id : null,
-                plot: raw.summary?.replace(/<[^>]+>/g, '') || raw.overview || raw.Plot || null,
-                poster: raw.image?.original || (raw.poster_path ? `https://image.tmdb.org/t/p/w500${raw.poster_path}` : raw.Poster) || null,
-                type: type,
+                plot: raw.summary?.replace(/<[^>]+>/g, '') || raw.overview || raw.biography || raw.Plot || null,
+                poster: poster,
+                type: type, // Now strictly controlled
                 popularity: raw.popularity,
-                imdbVotes: raw.imdbVotes,
+                voteCount: votes, 
                 raw,
                 _sourceMeta: { source, fetchedAt: Date.now() }
             };
@@ -1310,73 +1452,74 @@
         async function smartSearch(query, apiKeys, type = 'all', year = null) {
             const q = query.trim();
             const wrappedPromises = [];
-            if (type === 'all' || type === 'movie') wrappedPromises.push(searchTMDB(q, year, 'movie', apiKeys.tmdb).then(v => ({ v, s: 'tmdb' })));
-            if (type === 'all' || type === 'series') wrappedPromises.push(searchTMDB(q, year, 'series', apiKeys.tmdb).then(v => ({ v, s: 'tmdb' })));
-            if (type === 'all' || type === 'series') wrappedPromises.push(searchTVMaze(q).then(v => ({ v, s: 'tvmaze' })));
-            if (type === 'all' || type === 'movie') wrappedPromises.push(searchOMDB(q, year, 'movie', apiKeys.omdb).then(v => ({ v, s: 'omdb' })));
-            if (type === 'all' || type === 'series') wrappedPromises.push(searchOMDB(q, year, 'series', apiKeys.omdb).then(v => ({ v, s: 'omdb' })));
-            if (type === 'all' || type === 'series') wrappedPromises.push(searchJikan(q).then(v => ({ v, s: 'jikan' })));
-            if (type === 'all' || type === 'series') wrappedPromises.push(searchMDL(q, apiKeys.rapid).then(v => ({ v, s: 'mdl' })));
+            
+            // --- 1. NORMALIZE FILTER TYPE (The Fix) ---
+            // This ensures "Movies", "movie", "film" all work correctly
+            const cleanType = (type || 'all').toLowerCase();
+            const wantMovies = cleanType === 'all' || cleanType === 'movie' || cleanType === 'movies' || cleanType === 'film';
+            const wantSeries = cleanType === 'all' || cleanType === 'series' || cleanType === 'show' || cleanType === 'shows' || cleanType === 'tv';
+            const wantPeople = cleanType === 'all' || cleanType === 'person' || cleanType === 'people' || cleanType === 'actor';
+
+            // --- 2. DISPATCH API CALLS ---
+            
+            // TMDB Calls
+            if (wantMovies) wrappedPromises.push(searchTMDB(q, year, 'movie', apiKeys.tmdb).then(v => ({ v, s: 'tmdb', forceType: 'movie' })));
+            if (wantSeries) wrappedPromises.push(searchTMDB(q, year, 'series', apiKeys.tmdb).then(v => ({ v, s: 'tmdb', forceType: 'series' })));
+            if (wantPeople) wrappedPromises.push(searchTMDB(q, null, 'person', apiKeys.tmdb).then(v => ({ v, s: 'tmdb', forceType: 'person' })));
+
+            // TVMaze Calls (Always Series)
+            if (wantSeries) wrappedPromises.push(searchTVMaze(q).then(v => ({ v, s: 'tvmaze', forceType: 'series' })));
+
+            // OMDb Calls
+            if (apiKeys.omdb) {
+                if (wantMovies) wrappedPromises.push(searchOMDB(q, year, 'movie', apiKeys.omdb).then(v => ({ v, s: 'omdb', forceType: 'movie' })));
+                if (wantSeries) wrappedPromises.push(searchOMDB(q, year, 'series', apiKeys.omdb).then(v => ({ v, s: 'omdb', forceType: 'series' })));
+            }
 
             const wrappedResults = await Promise.allSettled(wrappedPromises);
             const rawCandidates = [];
 
-            // 1. Fix #1: Async TMDB ID Fetching inside search loop
+            // --- 3. PROCESS RESULTS ---
             for (const res of wrappedResults) {
                 if (res.status === 'fulfilled' && res.value?.v && !res.value.v.error) {
                     const val = res.value.v;
+                    const source = res.value.s;
+                    const forcedType = res.value.forceType;
+                    
                     let list = [];
-                    if (res.value.s === 'tmdb') {
-                        list = val.results || [];
-                        // Async fetch external IDs for TMDB results
-                        if (apiKeys.tmdb) {
-                            list = await Promise.all(list.map(async (item) => {
-                                const t = item.media_type === 'tv' || item.first_air_date ? 'tv' : 'movie';
-                                const ext = await safeFetch(`https://api.themoviedb.org/3/${t}/${item.id}/external_ids?api_key=${apiKeys.tmdb}`);
-                                if (ext?.imdb_id) item.external_ids = { imdb_id: ext.imdb_id };
-                                return item;
-                            }));
-                        }
-                    }
-                    else if (res.value.s === 'tvmaze') list = val.map(v => v.show) || [];
-                    else if (res.value.s === 'omdb') list = val.Search || [];
-                    else if (res.value.s === 'jikan') list = val.data || [];
-                    else if (res.value.s === 'mdl') list = val.results || [];
+                    if (source === 'tmdb') list = val.results || [];
+                    else if (source === 'tvmaze') list = val.map(v => v.show) || [];
+                    else if (source === 'omdb') list = val.Search || [];
+                    else if (source === 'mdl') list = val.results || [];
 
-                    list.forEach(item => rawCandidates.push(normalizeCandidate(item, res.value.s)));
+                    list.forEach(item => {
+                        rawCandidates.push(normalizeCandidate(item, source, forcedType));
+                    });
                 }
             }
 
             if (rawCandidates.length === 0) return { primary: [], more: [] };
-            rawCandidates.forEach((c, index) => {
-                const result = scoreCandidate({ item: c, query: q, targetYear: year, titleKey: 'title', index: index });
-                c.score = result.score;
-                c.reasons = result.reasons;
+
+            // --- 4. SCORING ---
+            rawCandidates.forEach((c) => {
+                const isExact = c.title.toLowerCase() === q.toLowerCase();
+                c.score = (isExact ? 100 : 0) + (c.voteCount > 5000 ? 50 : 0); 
             });
 
             const clusters = reconcile(rawCandidates);
             const mergedResults = clusters.map(cluster => mergeBest(cluster));
 
-            // --- ENHANCED RANKING & SPLITTING LOGIC ---
-            mergedResults.forEach(item => {
-                item.voteCount = extractVoteCount(item);
-                item.hasPoster = !!item.Poster && item.Poster !== "N/A";
-                // Elite ranking calculation: log(votes)*2 + confidence
-                item.eliteScore = (Math.log(item.voteCount || 1) * 2) + item.confidence;
+            // --- 5. FINAL SAFETY FILTER ---
+            // Removes stray results (e.g. if a TV show snuck into a Movie search)
+            const finalResults = mergedResults.filter(item => {
+                if (cleanType === 'all') return true;
+                if (wantMovies && item.type === 'movie') return true;
+                if (wantSeries && (item.type === 'series' || item.type === 'tv')) return true;
+                if (wantPeople && item.type === 'person') return true;
+                return false;
             });
 
-            const main = mergedResults
-                .filter(item => item.voteCount >= 1000 && item.hasPoster)
-                .sort((a, b) => b.eliteScore - a.eliteScore); // Primary sorted by elite ranking
-
-            const more = mergedResults
-                .filter(item => item.voteCount < 1000 || !item.hasPoster)
-                .sort((a, b) => b.voteCount - a.voteCount); // Secondary sorted by raw votes
-
-            return {
-                primary: main,
-                more: more
-            };
+            return { primary: finalResults, more: [] };
         }
 
         // ==========================================
@@ -1576,7 +1719,9 @@
             onAdminEdit,
             resumeTarget,
             onResume,
-            onClick
+            onClick,
+            onAddLink,
+            onWatchLocal
         }) => (
             <div
             onClick={(e) => {
@@ -1675,6 +1820,8 @@
                     resumeTarget={resumeTarget}
                     onResume={onResume}
                     onClick={onClick}
+                    onAddLink={onAddLink}
+                    onWatchLocal={onWatchLocal}
                 />
             </div>
         );
@@ -1706,120 +1853,165 @@
             </div>
         );
 
-
         const MediaCardHoverActions = ({
-            item,
-            isSeries,
-            onPlayTrailer,
-            isAdmin,
-            onAdminEdit,
-            resumeTarget,
-            onResume,
-            onClick
-        }) => {
+                item,
+                isSeries,
+                onPlayTrailer,
+                isAdmin,
+                onAdminEdit,
+                resumeTarget,
+                onResume,
+                onClick,
+                // --- NEW PROPS ---
+                onAddLink,
+                onWatchLocal
+            }) => {
 
-            const handleTrailer = useCallback((e) => {
-                e.stopPropagation();
-                onPlayTrailer(item);
-            }, [item, onPlayTrailer]);
-
-            const handleResume = useCallback((e) => {
-                e.stopPropagation();
-                onResume(item, resumeTarget);
-            }, [item, resumeTarget, onResume]);
-            
-            const handleMainClick = useCallback((e) => {
-                if (onClick) {
+                const handleTrailer = useCallback((e) => {
                     e.stopPropagation();
-                    onClick();
-                }
-            }, [onClick]);
-            return (
-                <div
-                    onClick={handleMainClick}
-                    className="
-                absolute inset-0
-                z-40
-                bg-gradient-to-t from-black/95 via-black/70 to-black/20
-                opacity-0 group-hover:opacity-100
-                transition-opacity duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]
-                flex flex-col justify-end
-                p-4
-                cursor-pointer
-            "
-                >
+                    onPlayTrailer(item);
+                }, [item, onPlayTrailer]);
 
-                    {/* Center Play Button */}
+                const handleResume = useCallback((e) => {
+                    e.stopPropagation();
+                    onResume(item, resumeTarget);
+                }, [item, resumeTarget, onResume]);
+
+                const handleMainClick = useCallback((e) => {
+                    if (onClick) {
+                        e.stopPropagation();
+                        onClick();
+                    }
+                }, [onClick]);
+
+                // --- NEW HANDLERS ---
+                const handleLinkClick = useCallback((e) => {
+                    e.stopPropagation();
+                    onAddLink(item);
+                }, [item, onAddLink]);
+
+                const handleWatchClick = useCallback((e) => {
+                    e.stopPropagation();
+                    onWatchLocal(item);
+                }, [item, onWatchLocal]);
+
+                return (
                     <div
+                        onClick={handleMainClick}
                         className="
-                    absolute top-1/2 left-1/2
-                    -translate-x-1/2 -translate-y-1/2
-                    scale-75 opacity-0
-                    group-hover:scale-100 group-hover:opacity-100
-                    transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]
-                "
+        absolute inset-0
+        z-40
+        bg-gradient-to-t from-black/95 via-black/70 to-black/20
+        opacity-0 group-hover:opacity-100
+        transition-opacity duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]
+        flex flex-col justify-end
+        p-4
+        cursor-pointer
+    "
                     >
-                        <button
-                            onClick={handleTrailer}
-                            title="Watch Trailer"
-                            className="
-                        relative
-                        bg-gradient-to-br from-indigo-500 to-purple-600
-                        p-5 rounded-full
-                        text-white
-                        shadow-[0_15px_50px_rgba(99,102,241,0.5)]
+                        {/* --- NEW: TOP RIGHT ACTIONS (Link & Local Watch) --- */}
+                        <div className="absolute top-3 right-3 flex flex-col gap-2">
+
+                            {/* 1. Watch Locally Button */}
+                            <button
+                                onClick={handleWatchClick}
+                                title="Watch in VLC (Local)"
+                                className="
+                        p-2 rounded-xl
+                        bg-white/10 backdrop-blur-md border border-white/10
+                        text-emerald-400
+                        hover:bg-emerald-500 hover:text-white
                         transition-all duration-300
-                        hover:scale-110
-                        hover:shadow-[0_20px_70px_rgba(139,92,246,0.6)]
-                        focus:outline-none
-                        focus-visible:ring-2
-                        focus-visible:ring-indigo-400/70
+                        shadow-lg
                     "
-                        >
-                            <Icon name="play" size={28} className="ml-1" />
+                            >
+                                <Icon name="play" size={16} /> {/* Using Play icon for Watch */}
+                            </button>
 
-                            {/* subtle glow layer */}
-                            <span className="absolute inset-0 rounded-full bg-gradient-to-br from-white/20 to-transparent opacity-30 pointer-events-none" />
-                        </button>
-                    </div>
+                            {/* 2. Add Link Button (Admin Only or everyone if preferred) */}
+                            {isAdmin && (
+                                <button
+                                    onClick={handleLinkClick}
+                                    title={item.media_path ? "Edit Local Path" : "Add Local Path"}
+                                    className={`
+                            p-2 rounded-xl
+                            backdrop-blur-md border border-white/10
+                            transition-all duration-300
+                            shadow-lg
+                            ${item.media_path
+                                            ? "bg-indigo-500 text-white"
+                                            : "bg-white/10 text-slate-400 hover:text-white"
+                                        }
+                        `}
+                                >
+                                    <Icon name="external" size={16} /> {/* Using External for Link */}
+                                </button>
+                            )}
+                        </div>
 
-                    {/* Resume Button */}
-                    {resumeTarget && (
-                        <button
-                            onClick={handleResume}
+                        {/* Center Play Trailer Button (Existing) */}
+                        <div
                             className="
-                        mt-3 w-full
-                        bg-indigo-600/90
-                        backdrop-blur-md
-                        text-white
-                        text-xs font-semibold
-                        py-2 rounded-xl
-                        shadow-[0_8px_30px_rgba(99,102,241,0.4)]
-                        transition-all duration-300
-                        hover:bg-indigo-500
-                        hover:shadow-[0_12px_40px_rgba(99,102,241,0.6)]
-                        hover:-translate-y-0.5
-                        focus:outline-none
-                        focus-visible:ring-2
-                        focus-visible:ring-indigo-400/70
-                    "
+            absolute top-1/2 left-1/2
+            -translate-x-1/2 -translate-y-1/2
+            scale-75 opacity-0
+            group-hover:scale-100 group-hover:opacity-100
+            transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]
+        "
                         >
-                            Resume S{resumeTarget.season} · E{resumeTarget.episode}
-                        </button>
-                    )}
+                            <button
+                                onClick={handleTrailer}
+                                title="Watch Trailer"
+                                className="
+                relative
+                bg-gradient-to-br from-indigo-500 to-purple-600
+                p-5 rounded-full
+                text-white
+                shadow-[0_15px_50px_rgba(99,102,241,0.5)]
+                transition-all duration-300
+                hover:scale-110
+                hover:shadow-[0_20px_70px_rgba(139,92,246,0.6)]
+                focus:outline-none
+            "
+                            >
+                                <Icon name="youtube" size={28} className="ml-1" />
+                            </button>
+                        </div>
 
-                    {/* Metadata */}
-                    <div className="mt-3 space-y-1">
-                        <p className="text-white text-xs font-medium line-clamp-2">
-                            {item.Genre}
-                        </p>
-                        <p className="text-slate-400 text-[10px] uppercase tracking-widest">
-                            {item.Year} • {isSeries ? "Series" : "Movie"}
-                        </p>
+                        {/* Resume Button (Existing) */}
+                        {resumeTarget && (
+                            <button
+                                onClick={handleResume}
+                                className="
+                mt-3 w-full
+                bg-indigo-600/90
+                backdrop-blur-md
+                text-white
+                text-xs font-semibold
+                py-2 rounded-xl
+                shadow-[0_8px_30px_rgba(99,102,241,0.4)]
+                transition-all duration-300
+                hover:bg-indigo-500
+                hover:shadow-[0_12px_40px_rgba(99,102,241,0.6)]
+                hover:-translate-y-0.5
+            "
+                            >
+                                Resume S{resumeTarget.season} · E{resumeTarget.episode}
+                            </button>
+                        )}
+
+                        {/* Metadata (Existing) */}
+                        <div className="mt-3 space-y-1">
+                            <p className="text-white text-xs font-medium line-clamp-2">
+                                {item.Genre}
+                            </p>
+                            <p className="text-slate-400 text-[10px] uppercase tracking-widest">
+                                {item.Year} • {isSeries ? "Series" : "Movie"}
+                            </p>
+                        </div>
                     </div>
-                </div>
-            );
-        };
+                );
+            };
 
 
         const MediaCardInfo = ({ item, isSeries }) => {
@@ -1882,12 +2074,16 @@
         };
 
         const MediaCard = ({
-            item,
-            onClick,
-            onAction,
-            onPlayTrailer,
-            onResume
-        }) => {
+                item,
+                onClick,
+                onAction,
+                onPlayTrailer,
+                onResume,
+                // --- Add these ---
+                isAdmin,
+                onAddLink,
+                onWatchLocal
+            }) => {
 
             const isSeries = item.Type === "series";
 
@@ -1951,6 +2147,10 @@
                         resumeTarget={resumeTarget}
                         onResume={onResume}
                         onClick={onClick}
+                        // --- Pass them down ---
+                        isAdmin={isAdmin}
+                        onAddLink={onAddLink}
+                        onWatchLocal={onWatchLocal}
                     />
 
                     <MediaCardInfo
@@ -1969,7 +2169,10 @@
             onPlayTrailer,
             onResume,
             icon,
-            emptyMessage
+            emptyMessage,
+            isAdmin,
+            onAddLink,
+            onWatchLocal
         }) => {
 
             if (!items.length) {
@@ -2027,6 +2230,9 @@
                                         onClick={() => onCardClick?.(item)}
                                         onPlayTrailer={() => onPlayTrailer?.(item)}
                                         onResume={() => onResume?.(item)}
+                                        isAdmin={isAdmin}
+                                        onAddLink={onAddLink}
+                                        onWatchLocal={onWatchLocal}
                                     />
                                 </div>
                             ))}
@@ -3488,6 +3694,10 @@
         };
 
         // --- NEW: Helper to organize episodes with images and plots ---
+        // --- NEW: VLC & Path Logic ---
+
+    // 1. State for User's Root Path
+    
         function processSeasonData(item) {
             // We prioritize TVMaze data as it usually has comprehensive episode lists with images/summaries
             const rawEpisodes = item.meta?.tvmaze?.episodes || [];
@@ -3543,39 +3753,21 @@
             const [activeTab, setActiveTab] = useState('overview');
             const [isRefreshing, setIsRefreshing] = useState(false);
             const [hoverRating, setHoverRating] = useState(0);
-            const [isHoveringRatingArea, setIsHoveringRatingArea] = useState(false); // New state for area hover
+            const [isHoveringRatingArea, setIsHoveringRatingArea] = useState(false);
 
-            // --- RATING EMOJI CONFIGURATION ---
             const RATING_EMOJIS = {
-                1: { e: "🤮", l: "Horrible" },
-                2: { e: "🤢", l: "Terrible" },
-                3: { e: "😩", l: "Bad" },
-                4: { e: "😕", l: "Poor" },
-                5: { e: "😐", l: "Average" },
-                6: { e: "🙂", l: "Okay" },
-                7: { e: "😊", l: "Good" },
-                8: { e: "😃", l: "Great" },
-                9: { e: "🤩", l: "Excellent" },
-                10: { e: "🤯", l: "Fabulous" }
+                1: { e: "🤮", l: "Horrible" }, 2: { e: "🤢", l: "Terrible" }, 3: { e: "😩", l: "Bad" },
+                4: { e: "😕", l: "Poor" }, 5: { e: "😐", l: "Average" }, 6: { e: "🙂", l: "Okay" },
+                7: { e: "😊", l: "Good" }, 8: { e: "😃", l: "Great" }, 9: { e: "🤩", l: "Excellent" }, 10: { e: "🤯", l: "Fabulous" }
             };
 
-            // --- Process season data ---
             const structuredSeasons = useMemo(() => {
                 if (item.Type !== 'series') return null;
                 return processSeasonData(item);
             }, [item]);
 
-            // --- Helpers ---
-            const primaryLanguage = item.Language ? item.Language.split(',')[0] : 'N/A';
+            const primaryLanguage = item.tmdb?.original_language ? item.tmdb.original_language.toUpperCase() : (item.Language ? item.Language.split(',')[0] : 'N/A');
             
-            const seriesStatus = useMemo(() => {
-                if (item.Type !== 'series') return null;
-                if (item.tmdb?.details?.status) return item.tmdb.details.status;
-                if (item.meta?.tvmaze?.status) return item.meta.tvmaze.status;
-                if (item.Year?.endsWith('–')) return "Ongoing";
-                return "Finished";
-            }, [item]);
-
             const handleRefresh = async (e) => {
                 e.stopPropagation();
                 if (isRefreshing || !onRefresh) return;
@@ -3584,53 +3776,26 @@
                 setIsRefreshing(false);
             };
 
-            // --- RATINGS DATA LOGIC (Brand Colors for Tiles) ---
+            // Ratings Data
             const ratingsData = useMemo(() => {
                 const list = [];
-                // 1. IMDb (Yellow/Black)
                 if (item.imdbID && item.imdbRating && item.imdbRating !== "N/A") {
-                    list.push({ source: "IMDb", value: item.imdbRating, bg: "bg-[#f5c518]", text: "text-black" });
+                    list.push({ source: "IMDb", value: item.imdbRating, bg: "bg-[#f5c518]", text: "text-black", url: `https://www.imdb.com/title/${item.imdbID}/` });
                 }
-                // 2. Rotten Tomatoes (Red/White)
                 const rt = item.Ratings?.find(r => r.Source === "Rotten Tomatoes");
-                if (rt) {
-                    list.push({ source: "RT", value: rt.Value, bg: "bg-[#fa320a]", text: "text-white" });
-                }
-                // 3. Metacritic (Green/White)
+                if (rt) list.push({ source: "RT", value: rt.Value, bg: "bg-[#fa320a]", text: "text-white" });
                 const mc = item.Ratings?.find(r => r.Source === "Metacritic");
-                if (mc) {
-                    list.push({ source: "Meta", value: mc.Value, bg: "bg-[#00ce7a]", text: "text-white" });
-                }
-                // 4. MyDramaList (Blue/White)
-                if (item.meta?.asian?.mdl) {
-                    list.push({ source: "MDL", value: item.meta.asian.mdl.rating, bg: "bg-[#2e51a2]", text: "text-white" });
-                }
-                // 5. MyAnimeList (Indigo/White)
-                if (item.meta?.anime) {
-                    list.push({ source: "MAL", value: item.meta.anime.score, bg: "bg-[#2e51a2]", text: "text-white" });
-                }
+                if (mc) list.push({ source: "Meta", value: mc.Value, bg: "bg-[#00ce7a]", text: "text-white" });
+                if (item.meta?.asian?.mdl) list.push({ source: "MDL", value: item.meta.asian.mdl.rating, bg: "bg-[#2e51a2]", text: "text-white", url: item.meta.asian.mdl.url });
+                if (item.meta?.anime) list.push({ source: "MAL", value: item.meta.anime.score, bg: "bg-[#2e51a2]", text: "text-white" });
                 return list;
             }, [item]);
 
-            const episodeProgress = useMemo(() => {
-                const episodes = item.meta?.tvmaze?.episodes || item.meta?.series?.episodes || [];
-                return calculateEpisodeProgress({ episodes, watchHistory });
-            }, [item, watchHistory]);
-
+            // Season Progress
             const seasonProgress = useMemo(() => {
                 if (!item.meta?.tvmaze?.episodes || !item.userMeta?.watchHistory) return [];
                 return calculateSeasonProgress({ episodes: item.meta.tvmaze.episodes, watchHistory: item.userMeta.watchHistory });
             }, [item]);
-
-            const gapNudge = useMemo(() => {
-                if (!episodeProgress || !episodeProgress.hasGaps) return null;
-                if (episodeProgress.isCompleted) return null;
-                if (episodeProgress.watchedEpisodes < 3) return null;
-                const gaps = detectSeasonGaps({ episodes: item.meta?.tvmaze?.episodes || item.meta?.series?.episodes || [], watchHistory: watchHistory });
-                if (gaps.length === 0) return null;
-                const s = gaps[0];
-                return { season: s.season, skipped: s.skipped, watched: s.watched };
-            }, [episodeProgress, item, watchHistory]);
 
             const scrollToSeason = (seasonNum) => {
                 const el = document.getElementById(`season-${seasonNum}`);
@@ -3639,110 +3804,100 @@
 
             return (
                 <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 lg:p-8 animate-fade-in">
-                    <div className="absolute inset-0 bg-black/90 backdrop-blur-2xl" onClick={onClose}></div>
-                    <div className="relative w-full max-w-6xl max-h-full glass rounded-[2rem] overflow-hidden flex flex-col lg:flex-row shadow-2xl border-white/10 animate-reveal">
+                    <div className="absolute inset-0 bg-black/95 backdrop-blur-3xl" onClick={onClose}>
+                        {/* Immersive Background Blur */}
+                        <div className="absolute inset-0 opacity-20 bg-cover bg-center blur-3xl scale-110 pointer-events-none" style={{ backgroundImage: `url(${getHighResPoster(item.Poster, 100)})` }}></div>
+                    </div>
+                    
+                    <div className="relative w-full max-w-7xl max-h-[90vh] glass rounded-[2.5rem] overflow-hidden flex flex-col lg:flex-row shadow-2xl border border-white/10 animate-reveal">
                         
-                        {/* Poster Side */}
-                        <div className="relative w-full lg:w-[400px] h-64 lg:h-auto shrink-0 overflow-hidden group cursor-pointer" onClick={() => onPlayTrailer && onPlayTrailer(item)}>
-                            <img src={getHighResPoster(item.Poster, 800)} alt={item.Title} loading="lazy" width="400" height="600" className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105" />
-                            <div className="absolute inset-0 bg-gradient-to-t from-vault-950 via-transparent lg:bg-gradient-to-r lg:from-transparent lg:to-vault-950"></div>
+                        {/* LEFT: Poster / Media Side */}
+                        <div className="relative w-full lg:w-[380px] shrink-0 bg-black/20 hidden lg:block">
+                            <div className="absolute inset-0">
+                                <img src={getHighResPoster(item.Poster, 800)} alt={item.Title} className="w-full h-full object-cover opacity-80" />
+                                <div className="absolute inset-0 bg-gradient-to-t from-vault-950 via-vault-950/20 to-transparent"></div>
+                                <div className="absolute inset-0 bg-gradient-to-r from-transparent to-vault-950"></div>
+                            </div>
                             
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                                <div className="bg-white/20 backdrop-blur-md p-4 rounded-full border border-white/30 shadow-2xl transform scale-75 group-hover:scale-100 transition-transform duration-300">
-                                    <Icon name="play" size={32} className="text-white fill-white ml-1" />
-                                </div>
-                                <div className="absolute bottom-8 text-white font-bold text-sm tracking-widest uppercase opacity-0 group-hover:opacity-100 transform translate-y-4 group-hover:translate-y-0 transition-all duration-300">
-                                    Watch Trailer
+                            {/* Poster Actions */}
+                            <div className="absolute bottom-8 left-8 right-8 flex flex-col gap-3 z-10">
+                                <button onClick={() => onPlayTrailer && onPlayTrailer(item)} className="w-full py-4 bg-white text-black font-black uppercase tracking-widest rounded-2xl hover:bg-indigo-400 hover:text-white transition-all flex items-center justify-center gap-2 shadow-xl shadow-white/10">
+                                    <Icon name="play" size={20} /> Watch Trailer
+                                </button>
+                                <div className="flex gap-2">
+                                    {item.tmdb?.social?.instagram_id && <a href={`https://instagram.com/${item.tmdb.social.instagram_id}`} target="_blank" className="flex-1 py-3 glass rounded-xl flex items-center justify-center hover:bg-pink-600 hover:text-white transition-all"><Icon name="external" size={18} /></a>}
+                                    {item.tmdb?.homepage && <a href={item.tmdb.homepage} target="_blank" className="flex-1 py-3 glass rounded-xl flex items-center justify-center hover:bg-indigo-500 hover:text-white transition-all"><Icon name="globe" size={18} /></a>}
+                                    {item.imdbID && <a href={`https://imdb.com/title/${item.imdbID}`} target="_blank" className="flex-1 py-3 glass rounded-xl flex items-center justify-center hover:bg-amber-400 hover:text-black transition-all font-black text-xs">IMDb</a>}
                                 </div>
                             </div>
-                            <button onClick={(e) => { e.stopPropagation(); onClose(); }} className="lg:hidden absolute top-4 right-4 bg-black/50 p-2 rounded-full text-white"><Icon name="close" /></button>
                         </div>
 
-                        {/* Content Side */}
-                        <div className="flex-1 flex flex-col overflow-hidden bg-vault-950">
+                        {/* RIGHT: Content Side */}
+                        <div className="flex-1 flex flex-col overflow-hidden bg-vault-950 relative">
                             
-                            {/* --- HEADER SECTION --- */}
-                            <div className="p-8 pb-4 flex justify-between items-start">
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex flex-wrap items-center gap-3 mb-2">
-                                        <Badge color="gold">{item.Rated}</Badge>
-                                        <Badge color="slate">{formatRuntime(item.Runtime)}</Badge>
-                                        <span className="text-slate-400 text-sm font-medium">{item.Year}</span>
-                                        
-                                        {/* Primary Language */}
-                                        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/5 border border-white/5">
-                                            <Icon name="globe" size={12} className="text-slate-400" />
-                                            <span className="text-xs font-bold text-slate-300">{primaryLanguage}</span>
-                                        </div>
+                            {/* Close Button Mobile */}
+                            <button onClick={onClose} className="lg:hidden absolute top-4 right-4 z-50 bg-black/50 p-2 rounded-full text-white"><Icon name="close" /></button>
 
-                                        {/* Series Status */}
-                                        {seriesStatus && (
-                                            <Badge color={seriesStatus === 'Ended' || seriesStatus === 'Finished' || seriesStatus === 'Canceled' ? 'red' : 'green'}>
-                                                {seriesStatus}
-                                            </Badge>
-                                        )}
-
-                                        {isAdmin && item._registry_source === 'api' && <Badge color="green">Registry: Fresh</Badge>}
-                                    </div>
-                                    
-                                    <h1 className="text-3xl lg:text-5xl font-black text-white leading-tight mb-3">{item.Title}</h1>
-                                    
-                                    {/* UPDATED: Solid Color Rating Tiles */}
-                                    {ratingsData.length > 0 && (
-                                        <div className="flex flex-wrap gap-3 mb-4">
-                                            {ratingsData.map((r, i) => (
-                                                <div key={i} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${r.bg} shadow-lg shadow-black/20`}>
-                                                    <span className={`text-[10px] font-black uppercase tracking-wider opacity-80 ${r.text}`}>{r.source}</span>
-                                                    <span className={`text-sm font-black ${r.text}`}>{r.value}</span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    )}
-
-                                    {topActors && topActors.some(a => item.meta?.cast?.some(c => normalizeActor(c.name) === a)) && (
-                                        <div className="mt-2"><Badge color="gold">Features one of your favorite actors</Badge></div>
-                                    )}
-                                    <p className="text-indigo-400 font-bold mt-2 text-sm uppercase tracking-widest">{item.Genre}</p>
+                            {/* --- HEADER --- */}
+                            <div className="p-8 pb-0 relative z-10">
+                                {/* Backdrop for mobile/small screens header area */}
+                                <div className="absolute inset-0 lg:hidden opacity-20 pointer-events-none">
+                                    <img src={getHighResPoster(item.Poster, 500)} className="w-full h-full object-cover blur-xl" />
+                                    <div className="absolute inset-0 bg-gradient-to-b from-transparent to-vault-950"></div>
                                 </div>
 
-                                <div className="flex flex-col items-end gap-2 ml-4">
-                                    <div className="flex gap-2">
-                                        <button 
-                                            onClick={handleRefresh} 
-                                            className={`hidden lg:flex bg-white/5 hover:bg-white/10 p-3 rounded-full text-white transition-all ${isRefreshing ? 'animate-spin text-indigo-400' : ''}`}
-                                            title="Force Refresh Metadata"
-                                        >
-                                            <Icon name="refresh" />
-                                        </button>
-                                        <button onClick={onClose} className="hidden lg:flex bg-white/5 hover:bg-white/10 p-3 rounded-full text-white transition-all"><Icon name="close" /></button>
-                                    </div>
-                                    {isAdmin && (
-                                        <button onClick={() => onFixMapping?.(item)}
-                                            className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-xs text-indigo-300 font-bold transition-all">Fix External Mapping</button>
+                                {/* Logo / Title Area */}
+                                <div className="relative">
+                                    {item.tmdb?.logo ? (
+                                        <img src={tmdbImg(item.tmdb.logo, "w500")} alt={item.Title} className="h-24 md:h-32 w-auto object-contain mb-4 drop-shadow-2xl" />
+                                    ) : (
+                                        <h1 className="text-3xl md:text-5xl font-black text-white leading-tight mb-2">{item.Title}</h1>
                                     )}
+                                    
+                                    {item.tmdb?.tagline && (
+                                        <p className="text-lg text-indigo-200 font-medium italic mb-6 opacity-90">"{item.tmdb.tagline}"</p>
+                                    )}
+
+                                    {/* Badges Row */}
+                                    <div className="flex flex-wrap items-center gap-3 mb-6">
+                                        <Badge color="gold">{item.Rated}</Badge>
+                                        <Badge color="slate">{formatRuntime(item.Runtime)}</Badge>
+                                        <span className="text-slate-400 text-sm font-bold">{item.Year}</span>
+                                        {primaryLanguage !== 'N/A' && <Badge color="slate">{primaryLanguage}</Badge>}
+                                        {isAdmin && (
+                                            <div className="flex gap-2 ml-auto">
+                                                <button onClick={() => onFixMapping?.(item)} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white" title="Fix Mapping"><Icon name="settings" size={14} /></button>
+                                                <button onClick={handleRefresh} className={`p-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white ${isRefreshing ? 'animate-spin' : ''}`} title="Refresh Data"><Icon name="refresh" size={14} /></button>
+                                                <button onClick={onClose} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-white hidden lg:block"><Icon name="close" size={14} /></button>
+                                            </div>
+                                        )}
+                                        {!isAdmin && <button onClick={onClose} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-white ml-auto hidden lg:block"><Icon name="close" size={14} /></button>}
+                                    </div>
+
+                                    {/* Ratings Row */}
+                                    <div className="flex flex-wrap gap-3 mb-6">
+                                        {ratingsData.map((r, i) => (
+                                            <a key={i} href={r.url} target="_blank" className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${r.bg} shadow-lg shadow-black/20 hover:scale-105 transition-transform`}>
+                                                <span className={`text-[10px] font-black uppercase tracking-wider opacity-80 ${r.text}`}>{r.source}</span>
+                                                <span className={`text-sm font-black ${r.text}`}>{r.value}</span>
+                                            </a>
+                                        ))}
+                                    </div>
                                 </div>
                             </div>
 
-                            {gapNudge && (
-                                <div className="mx-8 mb-6 p-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 text-amber-300 flex items-start gap-3 animate-reveal">
-                                    <Icon name="alert-circle" size={20} className="mt-0.5" />
-                                    <div className="flex-1">
-                                        <p className="font-semibold text-sm">You skipped {gapNudge.skipped} episode{gapNudge.skipped > 1 ? 's' : ''} in Season {gapNudge.season}</p>
-                                        <p className="text-xs opacity-80 mt-1">Want to catch up before moving ahead?</p>
-                                    </div>
-                                    <button onClick={() => { setActiveTab('seasons'); }} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 transition">View episodes</button>
-                                </div>
-                            )}
-
-                            <div className="px-8 flex gap-8 border-b border-white/5 overflow-x-auto no-scrollbar">
-                                {['overview', 'details', 'cast', 'seasons'].map(tab => (
+                            {/* TABS */}
+                            <div className="px-8 flex gap-8 border-b border-white/5 overflow-x-auto no-scrollbar relative z-10">
+                                {['overview', 'cast', 'media', 'details', 'seasons'].map(tab => (
                                     (tab !== 'seasons' || item.Type === 'series') && (
                                         <button key={tab} onClick={() => setActiveTab(tab)} className={`py-4 text-sm font-bold uppercase tracking-widest transition-all border-b-2 ${activeTab === tab ? 'border-indigo-500 text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}>{tab}</button>
                                     )
                                 ))}
                             </div>
 
-                            <div className="flex-1 p-8 overflow-y-auto custom-scrollbar">
+                            {/* SCROLLABLE CONTENT */}
+                            <div className="flex-1 p-8 overflow-y-auto custom-scrollbar relative z-10">
+                                
                                 {activeTab === 'overview' && (
                                     <div className="space-y-8 animate-reveal">
                                         
@@ -3757,7 +3912,7 @@
                                             </div>
                                         )}
 
-                                        {/* UPDATED: YOUR RATING AREA (Hover Reveal) */}
+                                        {/* YOUR RATING AREA */}
                                         <div 
                                             className="glass p-6 rounded-2xl border border-white/10 transition-all duration-300 hover:border-indigo-500/30 hover:bg-white/5"
                                             onMouseEnter={() => setIsHoveringRatingArea(true)}
@@ -3765,81 +3920,54 @@
                                         >
                                             <div className="flex justify-between items-start mb-4">
                                                 <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400">Your Rating</h3>
-                                                {/* Text always visible if rated, or if hovering */}
                                                 {(hoverRating > 0 || item.userMeta?.rating) && (
                                                     <div className="text-right">
-                                                        <p className="text-xl font-black text-white leading-none">
-                                                            {hoverRating > 0 ? RATING_EMOJIS[hoverRating].l : RATING_EMOJIS[item.userMeta.rating].l}
-                                                        </p>
-                                                        <p className="text-xs font-bold text-slate-500 mt-1">
-                                                            {hoverRating || item.userMeta.rating}/10
-                                                        </p>
+                                                        <p className="text-xl font-black text-white leading-none">{hoverRating > 0 ? RATING_EMOJIS[hoverRating].l : RATING_EMOJIS[item.userMeta.rating].l}</p>
+                                                        <p className="text-xs font-bold text-slate-500 mt-1">{hoverRating || item.userMeta.rating}/10</p>
                                                     </div>
                                                 )}
                                             </div>
                                             
-                                            {/* LOGIC: Show Single Big Emoji if Rated & Not Hovering. Else Show All. */}
                                             {item.userMeta?.rating && !isHoveringRatingArea ? (
-                                                <div className="flex justify-center py-2 animate-reveal">
-                                                    <span className="text-6xl filter drop-shadow-[0_0_15px_rgba(99,102,241,0.5)] transform scale-110">
-                                                        {RATING_EMOJIS[item.userMeta.rating].e}
-                                                    </span>
-                                                </div>
+                                                <div className="flex justify-center py-2 animate-reveal"><span className="text-6xl filter drop-shadow-[0_0_15px_rgba(99,102,241,0.5)] transform scale-110">{RATING_EMOJIS[item.userMeta.rating].e}</span></div>
                                             ) : (
                                                 <div className="flex flex-wrap justify-between gap-1 animate-reveal">
                                                     {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(star => (
-                                                        <button 
-                                                            key={star}
-                                                            onMouseEnter={() => setHoverRating(star)}
-                                                            onMouseLeave={() => setHoverRating(0)}
-                                                            onClick={() => onRate && onRate(item, star)}
-                                                            className={`
-                                                                text-3xl transition-all duration-200 hover:scale-125 focus:outline-none p-1
-                                                                ${(hoverRating || item.userMeta?.rating || 0) >= star ? 'opacity-100 grayscale-0' : 'opacity-30 grayscale'}
-                                                            `}
-                                                            title={`${star} - ${RATING_EMOJIS[star].l}`}
-                                                        >
-                                                            {RATING_EMOJIS[star].e}
-                                                        </button>
+                                                        <button key={star} onMouseEnter={() => setHoverRating(star)} onMouseLeave={() => setHoverRating(0)} onClick={() => onRate && onRate(item, star)} className={`text-3xl transition-all duration-200 hover:scale-125 focus:outline-none p-1 ${(hoverRating || item.userMeta?.rating || 0) >= star ? 'opacity-100 grayscale-0' : 'opacity-30 grayscale'}`} title={`${star} - ${RATING_EMOJIS[star].l}`}>{RATING_EMOJIS[star].e}</button>
                                                     ))}
                                                 </div>
                                             )}
-                                            
-                                            {!item.userMeta?.rating && (
-                                                <p className="mt-3 text-xs text-slate-500 text-center">Rate to automatically mark as watched.</p>
-                                            )}
+                                            {!item.userMeta?.rating && <p className="mt-3 text-xs text-slate-500 text-center">Rate to automatically mark as watched.</p>}
                                         </div>
 
                                         {/* SYNOPSIS */}
                                         <div>
                                             <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-3">Synopsis</h3>
-                                            <p className="text-slate-300 text-lg leading-relaxed">{item.Plot}</p>
+                                            <p className="text-slate-300 text-lg leading-relaxed">{item.tmdb?.details?.overview || item.Plot}</p>
                                         </div>
 
-                                        {/* CREW GRID */}
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Director</p><p className="text-white font-bold">{item.Director}</p></div>
-                                            <div className="glass p-4 rounded-2xl"><p className="text-[10px] text-slate-500 uppercase font-black mb-1">Writer</p><p className="text-white font-bold line-clamp-1">{item.Writer}</p></div>
-                                        </div>
-                                    </div>
-                                )}
-
-                                {activeTab === 'details' && (
-                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-6 animate-reveal">
-                                        {[
-                                            { label: 'Director', value: item.Director },
-                                            { label: 'Writer', value: item.Writer },
-                                            { label: 'Language', value: item.Language },
-                                            { label: 'Country', value: item.Country },
-                                            { label: 'Released', value: item.Released },
-                                            { label: 'Box Office', value: item.BoxOffice },
-                                            { label: 'Production', value: item.Production },
-                                        ].map(stat => (
-                                            <div key={stat.label} className="space-y-1">
-                                                <p className="text-[10px] text-slate-500 uppercase font-black">{stat.label}</p>
-                                                <p className="text-white font-bold text-sm">{stat.value || 'N/A'}</p>
+                                        {/* KEYWORDS */}
+                                        {item.tmdb?.keywords?.length > 0 && (
+                                            <div className="flex flex-wrap gap-2">
+                                                {item.tmdb.keywords.slice(0, 8).map(k => (
+                                                    <span key={k.id} className="px-3 py-1 bg-white/5 rounded-full text-xs text-slate-400 hover:text-white hover:bg-white/10 cursor-pointer transition-colors">#{k.name}</span>
+                                                ))}
                                             </div>
-                                        ))}
+                                        )}
+
+                                        {/* COLLECTION INFO */}
+                                        {item.tmdb?.collection && (
+                                            <div className="relative h-32 rounded-2xl overflow-hidden group cursor-pointer border border-white/10">
+                                                <img src={tmdbImg(item.tmdb.collection.backdrop_path, "w780")} className="w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
+                                                <div className="absolute inset-0 bg-black/60 flex items-center justify-between px-8">
+                                                    <div>
+                                                        <p className="text-xs font-bold text-indigo-400 uppercase tracking-widest mb-1">Part of the</p>
+                                                        <h4 className="text-2xl font-black text-white">{item.tmdb.collection.name}</h4>
+                                                    </div>
+                                                    <div className="bg-white/10 p-3 rounded-full"><Icon name="play" size={24} /></div>
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
 
@@ -3859,10 +3987,97 @@
                                     </div>
                                 )}
 
+                                {/* --- NEW: MEDIA TAB (Videos & Backdrops) --- */}
+                                {activeTab === 'media' && (
+                                    <div className="space-y-8 animate-reveal">
+                                        {/* Videos */}
+                                        {item.tmdb?.videos?.all?.length > 0 && (
+                                            <div>
+                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-4">Videos</h3>
+                                                <div className="flex gap-4 overflow-x-auto pb-4 no-scrollbar">
+                                                    {item.tmdb.videos.all.slice(0, 5).map(vid => (
+                                                        <div key={vid.key} onClick={() => window.open(`https://youtube.com/watch?v=${vid.key}`, '_blank')} className="w-64 shrink-0 group cursor-pointer">
+                                                            <div className="relative aspect-video rounded-xl overflow-hidden mb-2">
+                                                                <img src={`https://img.youtube.com/vi/${vid.key}/mqdefault.jpg`} className="w-full h-full object-cover group-hover:scale-105 transition-transform" />
+                                                                <div className="absolute inset-0 flex items-center justify-center bg-black/40 group-hover:bg-black/20 transition-colors"><div className="bg-white/20 p-3 rounded-full backdrop-blur-sm"><Icon name="play" size={20} /></div></div>
+                                                            </div>
+                                                            <p className="text-sm font-bold text-white line-clamp-1">{vid.name}</p>
+                                                            <p className="text-xs text-slate-500">{vid.type}</p>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                        {/* Backdrops */}
+                                        {item.tmdb?.backdrops?.length > 0 && (
+                                            <div>
+                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-4">Backdrops</h3>
+                                                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                                                    {item.tmdb.backdrops.slice(0, 6).map((img, i) => (
+                                                        <div key={i} className="aspect-video rounded-xl overflow-hidden bg-slate-800 hover:scale-105 transition-transform duration-500 cursor-pointer">
+                                                            <img src={tmdbImg(img.file_path, "w780")} loading="lazy" className="w-full h-full object-cover" />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {activeTab === 'details' && (
+                                    <div className="space-y-8 animate-reveal">
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                                            {[
+                                                { label: 'Director', value: item.Director },
+                                                { label: 'Writer', value: item.Writer },
+                                                { label: 'Released', value: item.Released },
+                                                { label: 'Status', value: item.tmdb?.status || item.userMeta?.status },
+                                                { label: 'Budget', value: item.tmdb?.budget ? formatCurrency(item.tmdb.budget) : 'N/A' },
+                                                { label: 'Revenue', value: item.tmdb?.revenue ? formatCurrency(item.tmdb.revenue) : item.BoxOffice },
+                                                { label: 'Original Title', value: item.tmdb?.original_title },
+                                                { label: 'Spoken Languages', value: item.tmdb?.spoken_languages?.join(', ') || item.Language },
+                                            ].map(stat => (
+                                                <div key={stat.label} className="space-y-1">
+                                                    <p className="text-[10px] text-slate-500 uppercase font-black">{stat.label}</p>
+                                                    <p className="text-white font-bold text-sm">{stat.value || 'N/A'}</p>
+                                                </div>
+                                            ))}
+                                        </div>
+
+                                        {/* Production Companies */}
+                                        {item.tmdb?.production_companies?.length > 0 && (
+                                            <div>
+                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-4">Production</h3>
+                                                <div className="flex flex-wrap gap-6 items-center bg-white/5 p-6 rounded-2xl">
+                                                    {item.tmdb.production_companies.map(c => (
+                                                        c.logo_path ? (
+                                                            <img key={c.id} src={tmdbImg(c.logo_path, "w200")} alt={c.name} className="h-8 md:h-10 w-auto object-contain brightness-0 invert opacity-70 hover:opacity-100 transition-opacity" title={c.name} />
+                                                        ) : (
+                                                            <span key={c.id} className="text-sm font-bold text-slate-400">{c.name}</span>
+                                                        )
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                        
+                                        {/* Networks (TV Only) */}
+                                        {item.tmdb?.networks?.length > 0 && (
+                                            <div>
+                                                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 mb-4">Networks</h3>
+                                                <div className="flex gap-4 items-center bg-white/5 p-6 rounded-2xl">
+                                                    {item.tmdb.networks.map(n => (
+                                                        n.logo_path && <img key={n.id} src={tmdbImg(n.logo_path, "w200")} className="h-8 w-auto object-contain brightness-0 invert opacity-80" title={n.name} />
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
                                 {activeTab === 'seasons' && structuredSeasons && (
                                     <div className="space-y-4 animate-reveal">
                                         <SeasonHeatmap seasons={seasonProgress} onSeasonClick={(season) => { scrollToSeason(season); }} />
-                                        {structuredSeasons.length === 0 ? <EmptyState message="No episode information available yet." /> : structuredSeasons.map(season => (
+                                        {structuredSeasons.map(season => (
                                             <details key={season.season} id={`season-${season.season}`} className="group glass rounded-2xl overflow-hidden transition-all duration-300">
                                                 <summary className="flex items-center justify-between p-6 cursor-pointer hover:bg-white/5 list-none relative overflow-hidden">
                                                     {season.poster && (<div className="absolute inset-0 opacity-20 pointer-events-none"><img src={season.poster} className="w-full h-full object-cover blur-sm" /><div className="absolute inset-0 bg-vault-950/50"></div></div>)}
@@ -3900,10 +4115,19 @@
                                 )}
                             </div>
                             
-                            <div className="p-8 pt-4 border-t border-white/5 flex gap-4 bg-vault-950/80 backdrop-blur-md">
+                            <div className="p-8 pt-4 border-t border-white/5 flex gap-4 bg-vault-950/80 backdrop-blur-md relative z-10">
                                 <button onClick={() => onUpdateStatus('watched')} className={`flex-1 py-4 rounded-2xl font-black text-sm uppercase tracking-[0.2em] transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] flex items-center justify-center gap-2 ${item.userMeta?.status === 'watched' ? 'bg-emerald-600 text-white shadow-[0_0_30px_rgba(16,185,129,0.4)]' : 'bg-white/5 text-slate-400 hover:text-white border border-white/5 hover:bg-white/10'}`}><Icon name="check" size={18} />Watched</button>
                                 <button onClick={() => onUpdateStatus('watchlist')} className={`flex-1 py-4 rounded-2xl font-black text-sm uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 ${item.userMeta?.status === 'watchlist' ? 'bg-indigo-600 text-white' : 'bg-white/5 text-slate-400 hover:text-white border border-white/5'}`}><Icon name="clock" size={18} />Watchlist</button>
-                                <button onClick={() => onRemove(item.imdbID)} className="px-6 py-4 rounded-2xl bg-rose-500/10 text-rose-500 border border-rose-500/20 hover:bg-rose-500 hover:text-white transition-all flex items-center justify-center" title="Remove from Library"><Icon name="trash" size={20} /></button>
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        onRemove(item.imdbID);
+                                    }}
+                                    className="px-6 py-4 rounded-2xl bg-rose-500/10 text-rose-500 border border-rose-500/20 hover:bg-rose-500 hover:text-white transition-all flex items-center justify-center group"
+                                    title="Remove from Library"
+                                >
+                                    <Icon name="trash" size={20} className="group-hover:scale-110 transition-transform" />
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -3914,96 +4138,137 @@
         const SearchOverlay = ({ isOpen, onClose, query, setQuery, results, onResultClick, isLoading, searchType, setSearchType, vault, isAdmin, onSuggest, onAdd }) => {
             if (!isOpen) return null;
 
-            // Collect all library items for robust check
+            // Collect all library items
             const libraryItems = useMemo(() => [...Object.values(vault.watched), ...Object.values(vault.watchlist)], [vault]);
 
             const renderResultCard = (item, idx) => {
                 const inVault = isInVault(item, libraryItems);
+                const isPerson = item.type === 'person';
 
                 return (
-                    <div key={`${item.imdbID || item.id}-${item._sourceMeta?.source || 'unknown'}-${idx}`} onClick={() => onResultClick(item)} className="group relative p-6 rounded-2xl glass hover:border-indigo-500/40 transition-all duration-300 cursor-pointer flex gap-6 overflow-hidden hover:scale-[1.02]">
-                        <div className="media-glow rounded-[2rem]"></div>
-                        <div className="w-24 aspect-[2/3] rounded-xl overflow-hidden bg-slate-800 shrink-0 shadow-xl shadow-black/50 group-hover:shadow-indigo-500/30 transition-all duration-300 relative">
-                            <img src={getHighResPoster(item.Poster, 200)} width="200" height="300" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" />
-                            {item.confidence > 50 && <div className="absolute top-1 right-1 bg-green-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">{Math.round(item.confidence)}% Match</div>}
-                        </div>
-                        <div className="flex-1 py-2 flex flex-col justify-center relative z-10">
-                            <div className="flex items-start justify-between"><h4 className="text-xl font-black text-white group-hover:text-indigo-400 transition-colors duration-300 leading-tight line-clamp-2">{item.Title}</h4></div>
-                            <p className="text-slate-500 font-bold uppercase tracking-widest text-[10px] mt-2">{item.Year} • {item.Type}</p>
+                    <div key={`${item.imdbID || item.tmdbID}-${idx}`} onClick={() => onResultClick(item)} className="group relative flex gap-5 p-4 rounded-2xl bg-white/5 border border-white/5 hover:bg-white/10 hover:border-indigo-500/30 transition-all duration-300 cursor-pointer overflow-hidden">
+                        
+                        {/* Glow Effect */}
+                        <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/0 via-indigo-500/5 to-indigo-500/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
 
-                            {/* --- ACTION SECTION REPLACEMENT --- */}
-                            {inVault ? (
-                                <div className="mt-3 bg-emerald-600/20 text-emerald-400 px-4 py-2 rounded-xl text-sm font-semibold border border-emerald-500/30 text-center">
-                                    Already in the Vault
-                                </div>
-                            ) : isAdmin ? (
-                                <button
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onAdd(item);
-                                    }}
-                                    className="mt-3 w-full bg-indigo-600 hover:bg-indigo-500 text-white py-2 rounded-xl font-semibold transition shadow-lg shadow-indigo-600/20"
-                                >
-                                    Add to Library
-                                </button>
+                        {/* Poster/Profile */}
+                        <div className="w-20 h-28 shrink-0 rounded-xl overflow-hidden bg-slate-800 shadow-lg relative">
+                            {item.Poster ? (
+                                <img src={item.Poster} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500" loading="lazy" />
                             ) : (
-                                <button
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onSuggest(item);
-                                    }}
-                                    className="mt-3 w-full bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 py-2 rounded-xl font-semibold border border-amber-500/30 transition"
-                                >
-                                    Suggest to Admin
-                                </button>
+                                <div className="absolute inset-0 flex items-center justify-center text-slate-600"><Icon name={isPerson ? "user" : "image"} size={24} /></div>
                             )}
+                        </div>
 
-                            {item._searchDebug && (
-                                <div className="mt-2 text-[10px] text-slate-400 space-y-0.5">{item._searchDebug.reasons.slice(0, 3).map(r => (<div key={r}>• {humanizeReason(r)}</div>))}</div>
-                            )}
-                            <div className="mt-3 flex flex-wrap gap-2">{item.sourcesUsed?.slice(0, 3).map(s => (<span key={s} className="px-2 py-0.5 rounded bg-white/5 text-[9px] uppercase font-bold text-slate-400">{s}</span>))}</div>
+                        {/* Content */}
+                        <div className="flex-1 flex flex-col justify-center min-w-0 relative z-10">
+                            <div className="flex justify-between items-start">
+                                <h4 className="text-lg font-bold text-white group-hover:text-indigo-400 transition-colors line-clamp-1">{item.Title}</h4>
+                                {item.voteCount > 0 && (
+                                    <div className="flex items-center gap-1 text-[10px] text-amber-400 font-bold bg-amber-400/10 px-2 py-0.5 rounded-full">
+                                        <Icon name="star" size={10} className="fill-amber-400" />
+                                        {(item.voteCount > 1000) ? `${(item.voteCount/1000).toFixed(1)}k` : item.voteCount}
+                                    </div>
+                                )}
+                            </div>
+                            
+                            <p className="text-slate-400 text-xs font-medium mt-1">
+                                {isPerson ? item.Year : `${item.Year || 'N/A'} • ${item.Type.charAt(0).toUpperCase() + item.Type.slice(1)}`}
+                            </p>
+
+                            {/* Actions */}
+                            <div className="mt-3 flex items-center gap-3">
+                                {isPerson ? (
+                                    <span className="text-xs text-indigo-400 font-bold uppercase tracking-wider">View Profile</span>
+                                ) : inVault ? (
+                                    <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-400 bg-emerald-400/10 px-3 py-1.5 rounded-lg border border-emerald-400/20">
+                                        <Icon name="check" size={12} /> In Vault
+                                    </div>
+                                ) : (
+                                    <div className="flex gap-2 w-full">
+                                        {isAdmin ? (
+                                            <button 
+                                                onClick={(e) => { e.stopPropagation(); onAdd(item); }}
+                                                className="flex-1 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg transition-colors shadow-lg shadow-indigo-600/20"
+                                            >
+                                                Add to Library
+                                            </button>
+                                        ) : (
+                                            <button 
+                                                onClick={(e) => { e.stopPropagation(); onSuggest(item); }}
+                                                className="flex-1 py-1.5 bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-bold rounded-lg border border-white/10 transition-colors"
+                                            >
+                                                Suggest
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
                         </div>
                     </div>
                 );
             };
 
             return (
-                <div className="fixed inset-0 z-[150] bg-vault-950/90 backdrop-blur-2xl animate-reveal p-4 lg:p-12 overflow-y-auto">
-                    <div className="absolute inset-0 -z-10 bg-gradient-to-br from-indigo-500/10 via-transparent to-emerald-500/10"></div>
-                    <div className="max-w-4xl mx-auto flex flex-col h-full">
-                        <div className="flex flex-col gap-4 mb-12">
-                            <div className="flex items-center gap-6">
-                                <div className="flex-1 relative group">
-                                    <Icon name="search" className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-indigo-500 transition-colors" size={24} />
-                                    <input autoFocus type="text" placeholder="Search Movies, Shows, Anime, or Dramas..." value={query} onChange={(e) => setQuery(e.target.value)} className="w-full bg-white/5 border-2 border-white/10 focus:border-indigo-500/70 focus:ring-4 focus:ring-indigo-500/20 rounded-3xl py-6 pl-16 pr-8 text-2xl font-bold text-white outline-none transition-all duration-300 placeholder:text-slate-600 shadow-xl shadow-black/40" />
-                                    {isLoading && <Icon name="refresh" className="absolute right-6 top-1/2 -translate-y-1/2 text-indigo-500 animate-spin" size={24} />}
+                <div className="fixed inset-0 z-[150] bg-black/95 backdrop-blur-md animate-fade-in p-4 lg:p-8 flex justify-center items-start overflow-y-auto">
+                    
+                    <div className="w-full max-w-3xl mt-12 flex flex-col gap-6">
+                        
+                        {/* SEARCH INPUT BAR */}
+                        <div className="relative group">
+                            <div className="absolute -inset-0.5 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-2xl blur opacity-30 group-focus-within:opacity-100 transition duration-500"></div>
+                            <div className="relative flex items-center bg-[#0a0c12] rounded-2xl border border-white/10 shadow-2xl">
+                                <div className="pl-5 text-slate-500 group-focus-within:text-indigo-400 transition-colors">
+                                    <Icon name="search" size={24} />
                                 </div>
-                                <button onClick={onClose} className="p-4 rounded-full hover:bg-white/5 text-slate-400 hover:text-white transition-all"><Icon name="close" size={32} /></button>
-                            </div>
-                            <div className="flex gap-3 justify-center">
-                                {['all', 'movie', 'series'].map(t => (
-                                    <button key={t} onClick={() => setSearchType(t)} className={`px-6 py-2 rounded-xl font-bold uppercase tracking-wider text-xs transition-all duration-300 backdrop-blur-md${searchType === t ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/40 scale-[1.05]' : 'bg-white/5 text-slate-400 border border-white/10 hover:border-indigo-500/40 hover:text-white hover:bg-white/10'}`}>{t === 'all' ? 'All Sources' : t + 's'}</button>
-                                ))}
+                                <input 
+                                    autoFocus 
+                                    type="text" 
+                                    placeholder="Search Movies, Shows, or People..." 
+                                    value={query} 
+                                    onChange={(e) => setQuery(e.target.value)} 
+                                    className="w-full bg-transparent border-none text-white text-lg font-medium p-5 focus:ring-0 outline-none placeholder:text-slate-600"
+                                />
+                                {isLoading && <div className="pr-5 text-indigo-500 animate-spin"><Icon name="refresh" size={20} /></div>}
+                                <button onClick={onClose} className="p-5 text-slate-500 hover:text-white transition-colors border-l border-white/5"><Icon name="close" size={20} /></button>
                             </div>
                         </div>
-                        <div className="flex-1 overflow-y-auto pr-2 no-scrollbar">
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                {results.primary && results.primary.map(renderResultCard)}
-                            </div>
 
-                            {results.more && results.more.length > 0 && (
-                                <div className="mt-8">
-                                    <h3 className="mb-6 text-sm text-slate-400 uppercase tracking-widest font-semibold border-b border-white/10 pb-3">More Results</h3>
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                        {results.more.map(renderResultCard)}
+                        {/* FILTER TABS */}
+                        <div className="flex gap-2 overflow-x-auto pb-2 no-scrollbar">
+                            {[
+                                { id: 'all', label: 'All Sources', icon: 'globe' },
+                                { id: 'movie', label: 'Movies', icon: 'play' },  // ID must be 'movie'
+                                { id: 'series', label: 'TV Shows', icon: 'grid' }, // ID must be 'series'
+                                { id: 'person', label: 'People', icon: 'user' }   // ID must be 'person'
+                            ].map(tab => (
+                                <button 
+                                    key={tab.id} 
+                                    onClick={() => setSearchType(tab.id)}
+                                    className={`
+                                        flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all whitespace-nowrap
+                                        ${searchType === tab.id 
+                                            ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] scale-105' 
+                                            : 'bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white border border-white/5'}
+                                    `}
+                                >
+                                    <Icon name={tab.icon} size={14} />
+                                    {tab.label}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* RESULTS GRID */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pb-20">
+                            {results.primary && results.primary.map(renderResultCard)}
+                            
+                            {query.length > 2 && results.primary?.length === 0 && !isLoading && (
+                                <div className="col-span-full py-12 text-center">
+                                    <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4 text-slate-600">
+                                        <Icon name="search" size={32} />
                                     </div>
-                                </div>
-                            )}
-
-                            {query.length > 2 && (!results.primary?.length && !results.more?.length) && !isLoading && (
-                                <div className="col-span-full py-20 text-center animate-reveal">
-                                    <h3 className="text-2xl font-black text-slate-500">No matches found</h3>
-                                    <p className="text-slate-500 mt-2 font-medium">We checked TMDB, OMDb, TVMaze, Jikan & MDL.</p>
+                                    <h3 className="text-xl font-bold text-white">No results found</h3>
+                                    <p className="text-slate-500 text-sm mt-1">Try searching for a different title or person.</p>
                                 </div>
                             )}
                         </div>
@@ -4355,6 +4620,113 @@
                 initAdmin();
             }, []);
 
+            const [userRootPath, setUserRootPath] = useState(null);
+
+            // 2. Fetch User Settings on Load
+            useEffect(() => {
+                if (session?.user) {
+                    supabase
+                        .from('user_settings')
+                        .select('vault_root_path')
+                        .eq('user_id', session.user.id)
+                        .single()
+                        .then(({ data }) => {
+                            if (data?.vault_root_path) {
+                                setUserRootPath(data.vault_root_path);
+                            }
+                        });
+                }
+            }, [session]);
+
+            // 3. Handle "Add Link" (Relative Path)
+            const handleAddLink = async (item) => {
+                if (!isAdmin) return alert("Only Admins can link global media paths.");
+
+                const fullPath = prompt(
+                    `Enter the FULL path for "${item.Title}":\n(e.g. G:\\My Drive\\The Vault\\Movies\\Film.mkv)`
+                );
+
+                if (!fullPath) return;
+
+                // Magic Regex: Finds "The Vault\" (case insensitive) and grabs everything AFTER it
+                // Matches "The Vault\" or "The Vault/"
+                const match = fullPath.match(/The\s*Vault[\\/](.*)/i);
+
+                if (!match || !match[1]) {
+                    alert("Error: Path must contain 'The Vault\\' folder structure.");
+                    return;
+                }
+
+                const relativePath = match[1]; // Result: "Movies\Yet to Watch\Film.mkv"
+
+                const { error } = await supabase
+                    .from('library')
+                    .update({ media_path: relativePath })
+                    .eq('imdbID', item.imdbID);
+
+                if (error) {
+                    alert("Error saving path: " + error.message);
+                } else {
+                    alert(`Link Saved!\nRelative Path: ${relativePath}`);
+                    // Optimistic update
+                    item.media_path = relativePath;
+                }
+            };
+
+            // 4. Handle "Watch" (Launch VLC)
+            const handleWatchLocal = async (item) => {
+                // A. Check if Item has a relative link
+                if (!item.media_path) {
+                    // If Admin, prompt to add it immediately
+                    if (isAdmin) {
+                        if (confirm(`No media link found for ${item.Title}.\nDo you want to add one now?`)) {
+                            handleAddLink(item);
+                        }
+                    } else {
+                        alert("This title hasn't been linked to a file yet.");
+                    }
+                    return;
+                }
+
+                // B. Check if User has set their Root Path
+                let currentRoot = userRootPath;
+
+                if (!currentRoot) {
+                    const input = prompt(
+                        "First Time Setup:\nEnter YOUR path to 'The Vault' folder:\n(e.g. G:\\My Drive\\The Vault\\)"
+                    );
+
+                    if (!input) return;
+
+                    // Ensure trailing slash
+                    let cleanInput = input.trim();
+                    if (!cleanInput.endsWith('\\') && !cleanInput.endsWith('/')) {
+                        cleanInput += '\\';
+                    }
+
+                    // Save to DB
+                    const { error } = await supabase
+                        .from('user_settings')
+                        .upsert({ user_id: session.user.id, vault_root_path: cleanInput });
+
+                    if (error) {
+                        alert("Failed to save settings.");
+                        return;
+                    }
+
+                    setUserRootPath(cleanInput);
+                    currentRoot = cleanInput;
+                }
+
+                // C. Combine & Launch
+                const fullPath = currentRoot + item.media_path;
+
+                // Clean quotes just in case
+                const cleanPath = fullPath.replace(/"/g, '');
+
+                // Trigger Custom Protocol
+                window.location.href = "openvlc:" + cleanPath;
+            };
             // --- USE REALTIME HOOKS ---
             const library = useRealtimeLibrary(); // The global list
             const adminSuggestions = useAdminSuggestions(session?.user);
@@ -4588,23 +4960,32 @@
             };
 
             const fetchSearch = async (query) => {
-                if (!query || query.length < 3) return;
+                if (!query || query.length < 2) return; // Allow 2 chars for short titles
                 setIsSearchLoading(true);
                 try {
-                    // --- UPDATED LOGIC: Handle structured return ---
                     const results = await smartSearch(query, apiKeys, searchType);
 
-                    const processList = (list) => list.map(item => ({
-                        ...item,
-                        // Use global helper instead of simple ID check
-                        inVault: isInVault(item, allVaultItems)
-                    }));
+                    const processAndSort = (list) => {
+                        return list.map(item => ({
+                            ...item,
+                            inVault: isInVault(item, allVaultItems)
+                        })).sort((a, b) => {
+                            // 1. Vault Items FIRST
+                            if (a.inVault && !b.inVault) return -1;
+                            if (!a.inVault && b.inVault) return 1;
+                            
+                            // 2. High Votes SECOND
+                            const votesA = typeof a.voteCount === 'number' ? a.voteCount : 0;
+                            const votesB = typeof b.voteCount === 'number' ? b.voteCount : 0;
+                            return votesB - votesA;
+                        });
+                    };
 
                     setSearchResults({
-                        primary: processList(results.primary),
-                        more: processList(results.more)
+                        primary: processAndSort(results.primary),
+                        more: []
                     });
-                } catch (e) { console.error(e); }
+                } catch (e) { console.error("Search Error:", e); }
                 setIsSearchLoading(false);
             };
 
@@ -4710,17 +5091,41 @@
                 await enrich(item);
             };
 
-            const removeFromVault = async (imdbID) => {
-                if (!confirm("Are you sure you want to delete this from your library?")) return;
+            const removeFromVault = async (idOrEvent) => {
+                // Handle case where event is passed directly or an ID string
+                let imdbID = idOrEvent;
+                if (idOrEvent && idOrEvent.stopPropagation) {
+                    idOrEvent.stopPropagation(); // Stop bubbling
+                    // If your button passed the event object instead of ID, this catches it (though we fixed the button below)
+                }
+
+                if (!imdbID || typeof imdbID !== 'string') {
+                    console.error("Invalid ID for deletion:", imdbID);
+                    return;
+                }
+
+                if (!confirm("Are you sure you want to remove this title from your library?")) return;
+
+                // 1. Close Modal Immediately for feedback
+                setSelectedItem(null);
+
+                // 2. Update Local State
                 setVault(prev => {
                     const next = { watched: { ...prev.watched }, watchlist: { ...prev.watchlist } };
-                    delete next.watched[imdbID];
-                    delete next.watchlist[imdbID];
+                    if (next.watched[imdbID]) delete next.watched[imdbID];
+                    if (next.watchlist[imdbID]) delete next.watchlist[imdbID];
                     return next;
                 });
-                setSelectedItem(null);
+
+                // 3. Delete from Database
                 if (session) {
-                    await supabase.from('vault_items').delete().eq('user_id', session.user.id).eq('imdb_id', imdbID);
+                    const { error } = await supabase
+                        .from('vault_items')
+                        .delete()
+                        .eq('user_id', session.user.id)
+                        .eq('imdb_id', imdbID);
+                    
+                    if (error) console.error("Supabase deletion error:", error);
                 }
             };
             // --- NEW: Handle User Rating ---
@@ -4825,18 +5230,31 @@
                 }
             }, [vault, selectedItem]);
 
+            // --- FIX: Robust Filtering & Sorting ---
             const filteredItems = useMemo(() => {
                 const all = allVaultItems;
+                
                 return all.filter(item => {
-                    // --- NEW VIEW MODE SUPPORT ---
-                    if (currentView === VIEWS.MOVIES) return item.Type === 'movie';
-                    if (currentView === VIEWS.SERIES) return item.Type === 'series';
+                    // 1. Normalize Type (Handle 'tv', 'series', 'movie', 'film', casing)
+                    const rawType = (item.Type || item.type || '').toLowerCase();
+                    const isSeries = rawType === 'series' || rawType === 'tv' || rawType === 'show' || rawType.includes('tv');
+                    const isMovie = rawType === 'movie' || rawType === 'film';
 
-                    if (activeFilter === 'all') return true;
-                    if (activeFilter === 'movies') return item.Type === 'movie';
-                    if (activeFilter === 'shows') return item.Type === 'series';
+                    // 2. View Mode Filtering (Sidebar/Tabs)
+                    if (currentView === VIEWS.MOVIES && !isMovie) return false;
+                    if (currentView === VIEWS.SERIES && !isSeries) return false;
+
+                    // 3. Active Filter Filtering (Pills)
+                    if (activeFilter === 'movies' && !isMovie) return false;
+                    if (activeFilter === 'shows' && !isSeries) return false;
+
                     return true;
-                }).sort((a, b) => (b.userMeta?.lastUpdated || 0) - (a.userMeta?.lastUpdated || 0));
+                }).sort((a, b) => {
+                    // Sort by Last Updated (Recent first)
+                    const dateA = a.userMeta?.lastUpdated || 0;
+                    const dateB = b.userMeta?.lastUpdated || 0;
+                    return dateB - dateA;
+                });
             }, [allVaultItems, activeFilter, currentView]);
 
             return (
@@ -4894,14 +5312,14 @@
                                     </div>
                                 )}
 
-                                <ContentRail title="Continue Watching" icon="play" items={continueWatching.map(cw => cw.item)} onCardClick={(item) => handleResume(item, continueWatching.find(cw => cw.item.imdbID === item.imdbID).resume)} />
-                                {asianDrama.length > 0 && <ContentRail title="Asian Dramas" icon="globe" items={asianDrama} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} />}
-                                {anime.length > 0 && <ContentRail title="Anime" icon="star" items={anime} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} />}
+                                <ContentRail title="Continue Watching" icon="play" items={continueWatching.map(cw => cw.item)} onCardClick={(item) => handleResume(item, continueWatching.find(cw => cw.item.imdbID === item.imdbID).resume)} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />
+                                {asianDrama.length > 0 && <ContentRail title="Asian Dramas" icon="globe" items={asianDrama} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />}
+                                {anime.length > 0 && <ContentRail title="Anime" icon="star" items={anime} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />}
                                 {genreProfile?.totalWeight > 50 && (
                                     <>
-                                        <ContentRail title="Actor Spotlight" icon="user" items={actorDrivenRecs} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} />
-                                        <ContentRail title="Recommended for You" icon="star" items={recommended} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} />
-                                        <ContentRail title="Outside Comfort Zone" icon="globe" items={exploreOutside} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} />
+                                        <ContentRail title="Actor Spotlight" icon="user" items={actorDrivenRecs} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />
+                                        <ContentRail title="Recommended for You" icon="star" items={recommended} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />
+                                        <ContentRail title="Outside Comfort Zone" icon="globe" items={exploreOutside} onCardClick={(item) => { setSelectedItem(item); enrich(item); }} isAdmin={isAdmin} onAddLink={handleAddLink} onWatchLocal={handleWatchLocal} />
                                     </>
                                 )}
                                 {filteredItems.length > 0 && activeFilter === 'all' && currentView === VIEWS.LIBRARY && (
@@ -4946,8 +5364,19 @@
                                     ) : (
                                         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-x-8 gap-y-12">
                                             {filteredItems.map(item => (
-                                                <MediaCard key={item.imdbID || item.id} item={item} isAdmin={isAdmin} onClick={() => { setSelectedItem(item); enrich(item); }} onPlayTrailer={handlePlayTrailer} onAdminEdit={(i) => console.log("Edit", i)} onResume={handleResume} />
-                                            ))}
+                                                            <MediaCard
+                                                                key={item.imdbID || item.id}
+                                                                item={item}
+                                                                isAdmin={isAdmin}
+                                                                onClick={() => { setSelectedItem(item); enrich(item); }}
+                                                                onPlayTrailer={handlePlayTrailer}
+                                                                onAdminEdit={(i) => console.log("Edit", i)}
+                                                                onResume={handleResume}
+                                                                // --- ADD THESE 2 PROPS ---
+                                                                onAddLink={handleAddLink}
+                                                                onWatchLocal={handleWatchLocal}
+                                                            />
+                                                        ))}
                                         </div>
                                     )}
                                 </section>
